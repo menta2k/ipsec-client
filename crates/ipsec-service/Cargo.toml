@@ -1,0 +1,45 @@
+[package]
+name = "ipsec-service"
+description = "Privileged IPsec VPN client service (Windows service + IPC server)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ipsec-service"
+path = "src/main.rs"
+
+[dependencies]
+ipc-proto.workspace = true
+vpn-core.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+# Console mode: clean teardown on Ctrl-C.
+ctrlc = "3.4"
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Service Control Manager integration.
+windows-service = "0.8"
+# Wintun TUN adapter (loads wintun.dll at runtime).
+wintun = "0.5.1"
+# Raw Win32: IP Helper, DPAPI, named pipes, security descriptors, event log.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_EventLog",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]

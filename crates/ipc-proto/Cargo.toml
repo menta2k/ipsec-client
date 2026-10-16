@@ -1,0 +1,11 @@
+[package]
+name = "ipc-proto"
+description = "Versioned GUI <-> service IPC contract for the IPsec client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true

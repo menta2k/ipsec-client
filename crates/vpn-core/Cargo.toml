@@ -1,0 +1,18 @@
+[package]
+name = "vpn-core"
+description = "OS-agnostic VPN engine: IKE session driver, ESP data path, state machine, profile store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ike.workspace = true
+ipc-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]

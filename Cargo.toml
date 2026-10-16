@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ike",
+    "crates/ipc-proto",
+    "crates/vpn-core",
+    "crates/ipsec-service",
+    "crates/ipsec-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.87"
+
+[workspace.dependencies]
+ike = { path = "crates/ike" }
+ipc-proto = { path = "crates/ipc-proto" }
+vpn-core = { path = "crates/vpn-core" }
+
+# crypto
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+num-bigint = "0.4"
+md4 = "0.10"
+des = "0.8"
+getrandom = "0.2"
+zeroize = { version = "1", features = ["derive", "serde"] }
+subtle = "2"
+hex = "0.4"
+
+# serialization / logging
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "registry"] }
+tracing-appender = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
