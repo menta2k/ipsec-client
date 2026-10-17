@@ -1,0 +1,98 @@
+# Continuous integration (002 T038; FR-028–FR-030).
+#   windows:   the gates on Windows (service, GUI, PLAP crate).
+#   linux:     the gates on Linux incl. the GUI, the root-only TUN test, and
+#              the .deb/.rpm packages.
+#   linux-e2e: the real client against a real strongSwan gateway in network
+#              namespaces (tests/linux-e2e/run.sh).
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Root-only tests (TUN device)
+        # Build as the runner user, run the binary as root, so `target/`
+        # never gets root-owned files.
+        run: |
+          bin="$(cargo test -p ipsec-service --bin ipsec-service --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          sudo "$bin" --ignored linux_tun --test-threads=1
+      - name: Packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Build packages
+        run: packaging/linux/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: error
+
+  linux-e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: strongSwan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            strongswan-swanctl charon-systemd libcharon-extra-plugins \
+            libstrongswan-extra-plugins iproute2 iputils-ping
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the service and the e2e driver
+        id: build
+        run: |
+          cargo build -p ipsec-service --locked
+          driver="$(cargo test -p ipsec-service --test linux_e2e --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          echo "driver=$driver" >> "$GITHUB_OUTPUT"
+      - name: End-to-end against strongSwan
+        run: |
+          sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
+               DRIVER_BIN="${{ steps.build.outputs.driver }}" \
+               tests/linux-e2e/run.sh

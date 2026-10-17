@@ -213,10 +213,16 @@ fn real_parts(
     info!(target: "host", version = env!("CARGO_PKG_VERSION"), "starting");
 
     let tun = Arc::new(LinuxTunFactory);
-    let net = Arc::new(LinuxNetConfig::detect(
-        SystemRunner,
-        std::path::PathBuf::from("/etc/resolv.conf"),
-    ));
+    // Tests in network namespaces cannot use the host's systemd-resolved
+    // (it does not see the namespace's interfaces): they force the
+    // resolv.conf path with their own file.
+    let net = Arc::new(match std::env::var_os("IPSEC_CLIENT_RESOLV_CONF") {
+        Some(path) => LinuxNetConfig::with_dns(
+            SystemRunner,
+            crate::linux::netconfig::DnsMode::ResolvConf(path.into()),
+        ),
+        None => LinuxNetConfig::detect(SystemRunner, std::path::PathBuf::from("/etc/resolv.conf")),
+    });
     info!(target: "host", dns = ?net.dns_mode(), "network configuration");
     let journal = Arc::new(FileJournal {
         path: dir.join("netstate.json"),
