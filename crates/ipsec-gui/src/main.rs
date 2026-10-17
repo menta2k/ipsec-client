@@ -7,6 +7,7 @@
 
 mod app;
 mod conn;
+mod icon;
 mod tray;
 mod views;
 
@@ -18,7 +19,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("IPsec Client")
             .with_inner_size([640.0, 520.0])
-            .with_min_inner_size([480.0, 380.0]),
+            .with_min_inner_size([480.0, 380.0])
+            .with_icon(egui::IconData {
+                rgba: icon::render(64, icon::APP),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     eframe::run_native(

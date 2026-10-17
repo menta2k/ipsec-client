@@ -1,6 +1,6 @@
 //! System tray icon and menu (FR-033, FR-034).
 //!
-//! Icons are drawn in code (a coloured disc per state), so no image assets or
+//! Icons are drawn in code (the app shield tinted per state), so no image assets or
 //! decoders are needed. Menu clicks are forwarded through a channel plus a
 //! wake-up so they are handled even while the window is hidden.
 //!
@@ -58,33 +58,16 @@ fn look(state: &ConnectionState) -> Look {
     }
 }
 
-/// A 32x32 RGBA disc with a light rim; a padlock-like dark core when on.
+/// The application shield, tinted by state.
 fn draw_icon(l: Look) -> Icon {
     const N: u32 = 32;
-    let (r, g, b) = match l {
-        Look::Off => (0x8a, 0x8f, 0x98),
-        Look::Busy => (0xe8, 0xa3, 0x17),
-        Look::On => (0x2e, 0xa0, 0x43),
-        Look::Error => (0xd6, 0x3a, 0x3a),
+    let fill = match l {
+        Look::Off => [0x8a, 0x8f, 0x98],
+        Look::Busy => [0xe8, 0xa3, 0x17],
+        Look::On => [0x2e, 0xa0, 0x43],
+        Look::Error => [0xd6, 0x3a, 0x3a],
     };
-    let mut px = Vec::with_capacity((N * N * 4) as usize);
-    let c = (N as f32 - 1.0) / 2.0;
-    for y in 0..N {
-        for x in 0..N {
-            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-            let (pr, pg, pb, a) = if d > 15.5 {
-                (0, 0, 0, 0)
-            } else if d > 13.5 {
-                (0xff, 0xff, 0xff, 0xe0)
-            } else if l == Look::On && d < 5.0 {
-                (0xff, 0xff, 0xff, 0xff)
-            } else {
-                (r, g, b, 0xff)
-            };
-            px.extend_from_slice(&[pr, pg, pb, a]);
-        }
-    }
-    Icon::from_rgba(px, N, N).expect("valid icon")
+    Icon::from_rgba(crate::icon::render(N, fill), N, N).expect("valid icon")
 }
 
 fn tooltip(state: &ConnectionState) -> String {

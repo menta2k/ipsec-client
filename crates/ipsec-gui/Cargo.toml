@@ -18,6 +18,10 @@ tray-icon = "0.26"
 # Desktop notifications (FR-038).
 notify-rust = "4"
 
+[build-dependencies]
+# Links the generated icon resource into the Windows executable (build.rs).
+embed-resource = "3"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # tray-icon on Linux runs on a GTK main loop (libappindicator).
 gtk = "0.18"
