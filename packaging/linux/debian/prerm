@@ -1,0 +1,13 @@
+#!/bin/sh
+# ipsec-client: Debian prerm. Stopping the service tears down any tunnel and
+# reverts routes/DNS (SIGTERM path). On upgrade the service keeps running
+# and postinst restarts it.
+set -e
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then
+            systemctl disable --now ipsec-client.service || true
+        fi
+        ;;
+esac
+exit 0

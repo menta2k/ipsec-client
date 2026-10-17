@@ -192,6 +192,15 @@ fn linux_tray_thread(
         let _ = ready.send(Err(format!("GTK init failed: {e}")));
         return;
     }
+    // AppIndicator icons only show if a StatusNotifier host runs (stock GNOME
+    // has none without its extension). Report that as "no tray" so the app
+    // keeps its window instead of vanishing (002 FR-022).
+    if !status_notifier_host_running() {
+        let _ = ready.send(Err(
+            "no system tray (StatusNotifier host) on this desktop".into()
+        ));
+        return;
+    }
     let mut core = match TrayCore::new(&ConnectionState::Disconnected, &[]) {
         Ok(c) => c,
         Err(e) => {
@@ -213,6 +222,31 @@ fn linux_tray_thread(
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
+}
+
+/// `org.freedesktop.DBus.NameHasOwner("org.kde.StatusNotifierWatcher")` on
+/// the session bus, via the gio that GTK already brings (002 research R9).
+#[cfg(target_os = "linux")]
+fn status_notifier_host_running() -> bool {
+    use gtk::gio;
+    use gtk::glib::{self, ToVariant};
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return false;
+    };
+    bus.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        Some(&("org.kde.StatusNotifierWatcher",).to_variant()),
+        Some(glib::VariantTy::new("(b)").expect("valid type string")),
+        gio::DBusCallFlags::NONE,
+        1000,
+        gio::Cancellable::NONE,
+    )
+    .ok()
+    .and_then(|v| v.get::<(bool,)>())
+    .is_some_and(|(owned,)| owned)
 }
 
 #[cfg(test)]

@@ -1800,6 +1800,7 @@ dependencies = [
  "gtk",
  "ipc-proto",
  "notify-rust",
+ "png",
  "serde_json",
  "tray-icon",
 ]

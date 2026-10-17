@@ -70,7 +70,7 @@ impl App {
         let tray = match Tray::create(wake.clone()) {
             Ok(t) => Some(t),
             Err(e) => {
-                eprintln!("warning: system tray unavailable ({e}); closing the window will exit");
+                eprintln!("warning: system tray unavailable ({e}); the window stays available and closing it minimizes");
                 None
             }
         };
@@ -343,6 +343,24 @@ fn notify(summary: &str, body: &str) {
     });
 }
 
+/// What closing the window does (002 FR-022).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Keep running in the tray.
+    HideToTray,
+    /// No tray to come back from: minimize instead of vanishing.
+    Minimize,
+    Exit,
+}
+
+pub fn close_action(has_tray: bool, quitting: bool) -> CloseAction {
+    match (quitting, has_tray) {
+        (true, _) => CloseAction::Exit,
+        (false, true) => CloseAction::HideToTray,
+        (false, false) => CloseAction::Minimize,
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(m) = self.backend.rx.try_recv() {
@@ -356,10 +374,20 @@ impl eframe::App for App {
         for a in actions {
             self.on_tray(ctx, a);
         }
-        // Closing the window hides it to the tray; "Quit" really exits.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Closing hides to the tray; without a tray it minimizes (the window
+        // is the only way back). "Quit" really exits.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            match close_action(self.tray.is_some(), self.quitting) {
+                CloseAction::HideToTray => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                CloseAction::Minimize => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                CloseAction::Exit => {}
+            }
         }
         // Tick the connected-duration display.
         if matches!(self.state, ConnectionState::Connected { .. }) {
@@ -375,6 +403,15 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                 ui.selectable_value(&mut self.tab, Tab::Log, "Log");
+                // Without a tray, closing only minimizes; this is the way out.
+                if self.tray.is_none() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Quit").clicked() {
+                            self.quitting = true;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                }
             });
             ui.add_space(2.0);
         });
@@ -395,5 +432,19 @@ impl eframe::App for App {
             }
         });
         self.password_dialog(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_the_window_depends_on_the_tray() {
+        assert_eq!(close_action(true, false), CloseAction::HideToTray);
+        assert_eq!(close_action(false, false), CloseAction::Minimize);
+        // An explicit Quit always exits.
+        assert_eq!(close_action(true, true), CloseAction::Exit);
+        assert_eq!(close_action(false, true), CloseAction::Exit);
     }
 }

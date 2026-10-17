@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=IPsec VPN Client
+Comment=Start the VPN tray icon at login
+Exec=ipsec-gui --tray
+Icon=ipsec-client
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

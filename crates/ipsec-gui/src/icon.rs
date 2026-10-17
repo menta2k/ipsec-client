@@ -8,6 +8,26 @@
 /// Brand colour of the application icon.
 pub const APP: [u8; 3] = [0x1f, 0x6f, 0xeb];
 
+/// Sizes of the PNG icon-theme files for Linux desktops (002 contract).
+pub const PNG_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+
+/// Icon-theme file name used by the `.desktop` entries (`Icon=ipsec-client`).
+pub const ICON_NAME: &str = "ipsec-client";
+
+/// Relative paths in the hicolor theme for each size.
+pub fn icon_files(sizes: &[u32]) -> Vec<(std::path::PathBuf, u32)> {
+    sizes
+        .iter()
+        .map(|&n| {
+            let p = std::path::Path::new("hicolor")
+                .join(format!("{n}x{n}"))
+                .join("apps")
+                .join(format!("{ICON_NAME}.png"));
+            (p, n)
+        })
+        .collect()
+}
+
 // Used by build.rs and the tests, not by the app itself.
 #[cfg_attr(not(test), allow(dead_code))]
 /// Sizes embedded in the Windows `.ico`, covering 100-300% display scaling.
@@ -190,6 +210,26 @@ mod tests {
         // The padlock body is white.
         let i = ((40 * 64 + 22) * 4) as usize;
         assert_eq!(&px[i..i + 3], &[0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn hicolor_layout_for_linux_desktops() {
+        let files = icon_files(&PNG_SIZES);
+        assert_eq!(files.len(), 7);
+        assert_eq!(
+            files[0],
+            (
+                std::path::PathBuf::from("hicolor/16x16/apps/ipsec-client.png"),
+                16
+            )
+        );
+        assert_eq!(
+            files.last().unwrap(),
+            &(
+                std::path::PathBuf::from("hicolor/256x256/apps/ipsec-client.png"),
+                256
+            )
+        );
     }
 
     #[test]

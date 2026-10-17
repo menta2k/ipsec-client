@@ -1,0 +1,14 @@
+#!/bin/sh
+# ipsec-client: Debian postrm. Profiles survive `remove` (so a reinstall
+# finds them) and are deleted only on `purge`. The ipsec-client user and
+# group are left in place, as is usual for sysusers accounts.
+set -e
+case "$1" in
+    purge)
+        rm -rf /var/lib/ipsec-client
+        ;;
+esac
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+exit 0

@@ -1,0 +1,35 @@
+#!/bin/sh
+# ipsec-client: Debian postinst (002 contracts/linux-system-integration.md,
+# "Package behaviour"). $1 = configure; $2 = previous version on upgrade.
+set -e
+
+add_installing_user() {
+    # The person who ran `sudo apt install` (or pkexec) may control the VPN
+    # after their next login.
+    user="${SUDO_USER:-}"
+    if [ -z "$user" ] && [ -n "${PKEXEC_UID:-}" ]; then
+        user="$(getent passwd "$PKEXEC_UID" | cut -d: -f1)"
+    fi
+    if [ -n "$user" ] && [ "$user" != "root" ] && id "$user" >/dev/null 2>&1; then
+        usermod -a -G ipsec-client "$user" || true
+        echo "ipsec-client: added $user to the ipsec-client group (log out and in to use the VPN)."
+    fi
+}
+
+if [ "$1" = "configure" ]; then
+    systemd-sysusers ipsec-client.conf
+    if [ -z "$2" ]; then
+        add_installing_user
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if [ -n "$2" ]; then
+            # Upgrade: profiles in /var/lib/ipsec-client are kept.
+            systemctl enable ipsec-client.service >/dev/null || true
+            systemctl try-restart ipsec-client.service || true
+        else
+            systemctl enable --now ipsec-client.service || true
+        fi
+    fi
+fi
+exit 0

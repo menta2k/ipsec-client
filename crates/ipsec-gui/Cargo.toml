@@ -15,6 +15,8 @@ ipc-proto.workspace = true
 eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 # System tray icon + menu.
 tray-icon = "0.26"
+# PNG icons for Linux packages (`--write-icons`, 002 T031).
+png = "0.18"
 # Desktop notifications (FR-038).
 notify-rust = "4"
 
@@ -28,3 +30,77 @@ gtk = "0.18"
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# ---------------------------------------------------------------------------
+# Linux packages (002 contracts/linux-system-integration.md). One package,
+# "ipsec-client", installs both binaries. Build with packaging/linux/build.sh.
+# Asset sources are relative to this crate; "target/release/..." resolves to
+# the workspace target directory. Icons come from `ipsec-gui --write-icons`.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "ipsec-client"
+# TODO(packaging): set a real maintainer before publishing.
+maintainer = "IPsec Client maintainers <maintainers@ipsec-client.invalid>"
+copyright = "IPsec Client contributors"
+section = "net"
+priority = "optional"
+extended-description = """\
+IPsec/IKEv2 remote-access VPN client: an unprivileged system service \
+(ipsec-client.service) that runs the tunnel, and a desktop app with a tray \
+icon to control it. Members of the 'ipsec-client' group may control the VPN."""
+# systemd-resolved is its own package from Debian 12 / Ubuntu 23.04 on; on
+# Ubuntu 22.04 it is part of systemd (< 252).
+depends = "$auto, iproute2, systemd, systemd-resolved | systemd (<< 252), libgtk-3-0, libayatana-appindicator3-1, libxdo3"
+maintainer-scripts = "../../packaging/linux/debian"
+conf-files = ["/etc/xdg/autostart/ipsec-client.desktop"]
+assets = [
+    ["target/release/ipsec-service", "usr/bin/", "755"],
+    ["target/release/ipsec-gui", "usr/bin/", "755"],
+    ["../../packaging/linux/ipsec-client.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/linux/ipsec-client.sysusers", "usr/lib/sysusers.d/ipsec-client.conf", "644"],
+    ["../../packaging/linux/50-ipsec-client.rules", "usr/share/polkit-1/rules.d/", "644"],
+    ["../../packaging/linux/ipsec-client.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/ipsec-client-autostart.desktop", "etc/xdg/autostart/ipsec-client.desktop", "644"],
+    ["../../README.md", "usr/share/doc/ipsec-client/README.md", "644"],
+    ["../../target/linux-icons/hicolor/16x16/apps/ipsec-client.png", "usr/share/icons/hicolor/16x16/apps/", "644"],
+    ["../../target/linux-icons/hicolor/24x24/apps/ipsec-client.png", "usr/share/icons/hicolor/24x24/apps/", "644"],
+    ["../../target/linux-icons/hicolor/32x32/apps/ipsec-client.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["../../target/linux-icons/hicolor/48x48/apps/ipsec-client.png", "usr/share/icons/hicolor/48x48/apps/", "644"],
+    ["../../target/linux-icons/hicolor/64x64/apps/ipsec-client.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["../../target/linux-icons/hicolor/128x128/apps/ipsec-client.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["../../target/linux-icons/hicolor/256x256/apps/ipsec-client.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "ipsec-client"
+summary = "IPsec/IKEv2 VPN client: system service and tray app"
+license = "MIT OR Apache-2.0"
+post_install_script = "../../packaging/linux/rpm/post.sh"
+pre_uninstall_script = "../../packaging/linux/rpm/preun.sh"
+post_uninstall_script = "../../packaging/linux/rpm/postun.sh"
+assets = [
+    { source = "target/release/ipsec-service", dest = "/usr/bin/ipsec-service", mode = "755" },
+    { source = "target/release/ipsec-gui", dest = "/usr/bin/ipsec-gui", mode = "755" },
+    { source = "../../packaging/linux/ipsec-client.service", dest = "/usr/lib/systemd/system/ipsec-client.service", mode = "644" },
+    { source = "../../packaging/linux/ipsec-client.sysusers", dest = "/usr/lib/sysusers.d/ipsec-client.conf", mode = "644" },
+    { source = "../../packaging/linux/50-ipsec-client.rules", dest = "/usr/share/polkit-1/rules.d/50-ipsec-client.rules", mode = "644" },
+    { source = "../../packaging/linux/ipsec-client.desktop", dest = "/usr/share/applications/ipsec-client.desktop", mode = "644" },
+    { source = "../../packaging/linux/ipsec-client-autostart.desktop", dest = "/etc/xdg/autostart/ipsec-client.desktop", mode = "644", config = "noreplace" },
+    { source = "../../README.md", dest = "/usr/share/doc/ipsec-client/README.md", mode = "644", doc = true },
+    { source = "../../target/linux-icons/hicolor/16x16/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/16x16/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/24x24/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/24x24/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/32x32/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/32x32/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/48x48/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/48x48/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/64x64/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/64x64/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/128x128/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/128x128/apps/ipsec-client.png", mode = "644" },
+    { source = "../../target/linux-icons/hicolor/256x256/apps/ipsec-client.png", dest = "/usr/share/icons/hicolor/256x256/apps/ipsec-client.png", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+iproute = "*"
+systemd = "*"
+systemd-resolved = "*"
+gtk3 = "*"
+libayatana-appindicator-gtk3 = "*"
+libxdo = "*"

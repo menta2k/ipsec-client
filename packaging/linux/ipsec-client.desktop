@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=IPsec VPN Client
+GenericName=VPN Client
+Comment=Connect to your organisation's IPsec/IKEv2 VPN
+Exec=ipsec-gui
+Icon=ipsec-client
+Terminal=false
+Categories=Network;
+Keywords=VPN;IPsec;IKEv2;
+StartupNotify=false
