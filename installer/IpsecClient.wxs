@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-machine MSI for the IPsec VPN client (WiX Toolset 5).
+  Build with installer\build.ps1; it supplies the preprocessor variables:
+    Version  - product version from the workspace Cargo.toml
+    BinDir   - directory holding ipsec-service.exe and ipsec-gui.exe
+    Wintun   - path to the amd64 wintun.dll
+  The service registration mirrors `ipsec-service install`
+  (crates/ipsec-service/src/windows/service.rs).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="IPsec VPN Client"
+           Manufacturer="IpsecClient"
+           Version="$(var.Version)"
+           UpgradeCode="A4E1B4FA-B375-4AC8-8BB7-B7384EFD23AC"
+           Scope="perMachine"
+           InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPCOMMENTS" Value="IPsec/IKEv2 VPN client: background service and tray application." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="IpsecClient" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="IPsec VPN Client" Level="1">
+      <ComponentGroupRef Id="Service" />
+      <ComponentGroupRef Id="Gui" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="Service" Directory="INSTALLFOLDER">
+      <Component Id="ServiceExe">
+        <File Id="ServiceExe" Source="$(var.BinDir)\ipsec-service.exe" KeyPath="yes" />
+        <ServiceInstall Name="IpsecClient"
+                        DisplayName="IPsec VPN Client Service"
+                        Description="Establishes IPsec/IKEv2 VPN tunnels on behalf of the IPsec Client GUI."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="service"
+                        Vital="yes">
+          <!-- Restart 5 s after the first two failures; reset the count daily. -->
+          <util:ServiceConfig FirstFailureActionType="restart"
+                              SecondFailureActionType="restart"
+                              ThirdFailureActionType="none"
+                              RestartServiceDelayInSeconds="5"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <!-- Stopping the service tears down the tunnel and reverts routes/DNS. -->
+        <ServiceControl Id="ServiceControl" Name="IpsecClient"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+      </Component>
+      <Component Id="WintunDll">
+        <File Id="WintunDll" Source="$(var.Wintun)" Name="wintun.dll" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="Gui" Directory="INSTALLFOLDER">
+      <Component Id="GuiExe">
+        <File Id="GuiExe" Source="$(var.BinDir)\ipsec-gui.exe" KeyPath="yes" />
+      </Component>
+      <!-- Non-advertised shortcuts need an HKCU key path (ICE43/ICE57). -->
+      <Component Id="GuiStartMenu" Directory="ProgramMenuFolder">
+        <Shortcut Id="GuiStartMenu" Name="IPsec VPN Client"
+                  Target="[INSTALLFOLDER]ipsec-gui.exe" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\IpsecClient" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <!-- Start the tray agent hidden at every user's logon. -->
+      <Component Id="GuiAutostart">
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="IpsecClient" Type="string"
+                       Value="&quot;[INSTALLFOLDER]ipsec-gui.exe&quot; --tray" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

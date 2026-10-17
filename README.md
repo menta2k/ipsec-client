@@ -103,6 +103,30 @@ Data lives in `%ProgramData%\IpsecClient`, which only SYSTEM and Administrators 
 The service runs IKE_SA_INIT from UDP source port 500 if it is free. If the Windows IKEEXT
 service holds that port, it falls back to an ephemeral port.
 
+### Windows installer (MSI)
+
+```powershell
+.\installer\build.ps1 -Wintun <path to wintun\bin\amd64\wintun.dll>
+```
+
+The script needs the .NET SDK, and restores WiX 5 as a repo-local dotnet tool. It builds the
+release binaries and writes `target\installer\IpsecClient-<version>-x64.msi`. Without
+`-Wintun`, it looks for `wintun.dll` in `target\release`, then `target\debug`.
+
+The MSI is per-machine. It installs to `C:\Program Files\IpsecClient` and:
+
+- registers and starts the `IpsecClient` service, the same way `ipsec-service install` does
+  (automatic start, LocalSystem, restart 5 s after a failure)
+- adds a Start menu shortcut
+- starts the tray hidden at every logon (`HKLM\...\Run`)
+
+Uninstalling stops the service, which removes the tunnel, and deletes the service. It keeps
+`%ProgramData%\IpsecClient`, so profiles survive a reinstall. Upgrades replace the previous
+version in place once the workspace version in `Cargo.toml` is raised.
+
+If the service was registered earlier with `ipsec-service install`, run
+`ipsec-service uninstall` first. Otherwise the MSI can't create a service with the same name.
+
 ## Status
 
 The protocol core, IPC, engine and GUI build and pass their tests. The Windows platform layer
