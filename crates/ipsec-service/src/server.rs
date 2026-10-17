@@ -263,10 +263,13 @@ pub fn handle(req: Request, peer: &Peer, client: &str, ctx: &ServerCtx) -> Respo
             id,
             password,
             save_password,
-        } => match ctx.engine.connect(&id, password, save_password) {
-            Ok(()) => Response::Ok,
-            Err(e) => reject(e),
-        },
+        } => {
+            info!(target: "ipc", client, peer = %peer.desc, origin = "app", "connect requested");
+            match ctx.engine.connect(&id, password, save_password) {
+                Ok(()) => Response::Ok,
+                Err(e) => reject(e),
+            }
+        }
         Request::Disconnect => match ctx.engine.disconnect() {
             Ok(()) => Response::Ok,
             Err(e) => reject(e),
@@ -453,6 +456,66 @@ mod tests {
             Err(ipc_proto::ClientError::Failed { code, .. }) => code,
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    /// Every connect is logged with its origin and the OS-attested peer
+    /// (003 FR-015).
+    #[test]
+    fn connects_are_logged_with_origin_and_peer() {
+        use tracing_subscriber::prelude::*;
+        let (ctx, _) = ctx();
+        let id = ctx.store.create(&edit()).unwrap().id;
+        ctx.store.set_sign_in(&id, true).unwrap();
+        let peer = Peer {
+            is_admin: false,
+            desc: "pid=4242 user=TEST\\alice".into(),
+        };
+        let sub = tracing_subscriber::registry().with(ctx.logs.layer());
+        tracing::subscriber::with_default(sub, || {
+            handle(
+                Request::Connect {
+                    id: id.clone(),
+                    password: Some(SecretString::new("pw")),
+                    save_password: false,
+                },
+                &peer,
+                "gui",
+                &ctx,
+            );
+            handle(
+                Request::ConnectAtSignIn {
+                    id: id.clone(),
+                    password: Some(SecretString::new("pw")),
+                },
+                &peer,
+                "plap",
+                &ctx,
+            );
+        });
+        let lines: Vec<String> = ctx.logs.recent(50).into_iter().map(|l| l.message).collect();
+        let find = |origin: &str| {
+            lines
+                .iter()
+                .find(|m| m.contains(&format!("origin={origin}")))
+                .unwrap_or_else(|| panic!("no origin={origin} line in {lines:?}"))
+                .clone()
+        };
+        let app = find("app");
+        assert!(
+            app.contains("pid=4242") && app.contains("client=gui"),
+            "{app}"
+        );
+        let sign_in = find("sign_in_screen");
+        assert!(
+            sign_in.contains("pid=4242") && sign_in.contains("client=plap"),
+            "{sign_in}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|m| m.contains("pw\"") || m.contains("=pw")),
+            "{lines:?}"
+        );
     }
 
     #[test]

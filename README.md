@@ -137,6 +137,18 @@ version in place once the workspace version in `Cargo.toml` is raised.
 If the service was registered earlier with `ipsec-service install`, run
 `ipsec-service uninstall` first. Otherwise the MSI can't create a service with the same name.
 
+### Pre-Login Connect (Windows, in development)
+
+Pre-Login Connect lets users connect the VPN from the Windows sign-in screen, through
+**Network sign-in**. The service side already works:
+
+- administrator-chosen sign-in profiles (`ipsec-service plc enable <name>`)
+- the sign-out policy (`plc policy`)
+- unattended profile import (`profile import`)
+
+The sign-in screen component itself is not built yet. The administrator guide, including the
+recovery procedure, is [docs/pre-login-connect.md](docs/pre-login-connect.md).
+
 ## Status
 
 The protocol core, IPC, engine and GUI build and pass their tests. The Windows platform layer

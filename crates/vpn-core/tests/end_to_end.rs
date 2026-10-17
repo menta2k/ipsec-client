@@ -565,6 +565,14 @@ fn signout_disconnects_by_default_and_waits_for_cleanup() {
     h.connect(Some(PASSWORD));
     h.wait_connected();
     assert!(h.mgr.on_signout(ipc_proto::Policy::default()));
+    // FR-015: the sign-out disconnect is logged with its reason.
+    assert!(
+        logs()
+            .recent(100_000)
+            .iter()
+            .any(|l| l.message.contains("reason=signout")),
+        "no reason=signout log line"
+    );
     // Synchronous: the network is already restored when it returns (FR-012).
     assert!(!h.mgr.state().is_active());
     h.assert_clean();
