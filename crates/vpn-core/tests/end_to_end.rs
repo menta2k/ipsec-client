@@ -450,6 +450,37 @@ fn network_failure_rolls_back() {
 }
 
 #[test]
+fn prepared_backup_is_journaled_before_dns_and_reverted_last() {
+    let h = harness_with(
+        ResponderConfig::default(),
+        |_| {},
+        |net| {
+            *net.dns_backup.lock().unwrap() = Some("nameserver 192.0.2.1\n".into());
+        },
+    );
+    h.connect(Some(PASSWORD));
+    h.wait_connected();
+    let backup = NetChange::ResolvConf {
+        backup: "nameserver 192.0.2.1\n".into(),
+    };
+    let is_dns = |c: &NetChange| matches!(c, NetChange::Dns { .. });
+    for (what, list) in [
+        ("journal", h.journal.load().unwrap()),
+        ("applied", h.net.applied.lock().unwrap().clone()),
+    ] {
+        let b = list.iter().position(|c| *c == backup);
+        let d = list.iter().position(is_dns);
+        assert!(
+            matches!((b, d), (Some(b), Some(d)) if b + 1 == d),
+            "{what}: backup must come right before DNS: {list:?}"
+        );
+    }
+    h.mgr.disconnect().unwrap();
+    h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
+    h.assert_clean();
+}
+
+#[test]
 fn shutdown_while_connected_cleans_up() {
     let h = harness(ResponderConfig::default(), |_| {});
     h.connect(Some(PASSWORD));

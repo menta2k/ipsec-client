@@ -1,5 +1,5 @@
-//! Unix-domain-socket listener (mock mode on Linux/macOS). The socket file is
-//! created with mode 0600 so only the owning user can connect.
+//! Unix-domain-socket listener: mode 0600 for the per-user mock socket, 0660
+//! for the Linux system service (members of its group may connect).
 
 use crate::server::Listener;
 use ipc_proto::client::Stream;
@@ -16,10 +16,10 @@ pub struct UnixSocketListener {
 }
 
 impl UnixSocketListener {
-    pub fn bind(path: PathBuf) -> io::Result<Self> {
+    pub fn bind(path: PathBuf, mode: u32) -> io::Result<Self> {
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
         Ok(UnixSocketListener {
             listener,
             path,

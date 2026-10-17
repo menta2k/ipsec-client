@@ -699,17 +699,24 @@ fn apply_network(
     }
 
     let mut applied: Vec<NetChange> = Vec::new();
+    let fail = |applied: &[NetChange], c: &NetChange, e: std::io::Error| {
+        revert_network(deps, applied);
+        SessionError::new(
+            ErrorCode::NetConfigError,
+            format!("Could not configure the network ({c:?}): {e}"),
+        )
+    };
     for c in changes {
-        applied.push(c.clone());
-        let journaled = deps.journal.save(&applied);
-        let result = journaled.and_then(|_| deps.net.apply(&c));
-        if let Err(e) = result {
-            applied.pop();
-            revert_network(deps, &applied);
-            return Err(SessionError::new(
-                ErrorCode::NetConfigError,
-                format!("Could not configure the network ({c:?}): {e}"),
-            ));
+        // The platform may need an extra change journaled first (e.g. the
+        // resolv.conf backup), so a crash can still restore the original.
+        let extra = deps.net.prepare(&c).map_err(|e| fail(&applied, &c, e))?;
+        for step in extra.into_iter().chain(std::iter::once(c)) {
+            applied.push(step.clone());
+            let journaled = deps.journal.save(&applied);
+            if let Err(e) = journaled.and_then(|_| deps.net.apply(&step)) {
+                applied.pop();
+                return Err(fail(&applied, &step, e));
+            }
         }
     }
     info!(target: TARGET, changes = applied.len(), full_tunnel = plan.full_tunnel, "network configured");

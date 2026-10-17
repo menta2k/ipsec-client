@@ -23,8 +23,7 @@ pub fn data_dir(mock: bool) -> PathBuf {
 }
 
 /// IPC socket of the real Linux service (`$IPSEC_CLIENT_SOCKET` overrides).
-// TODO(T016): used by the Linux host; remove the allow once wired.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn socket_path() -> PathBuf {
     socket_path_for(|k| std::env::var_os(k))
 }
@@ -57,7 +56,7 @@ fn state_dir_for(p: Platform, env: impl Fn(&str) -> Option<OsString>) -> PathBuf
     }
 }
 
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn socket_path_for(env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     env(ipc_proto::client::SOCKET_ENV)
         .map(PathBuf::from)

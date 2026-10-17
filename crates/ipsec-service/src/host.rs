@@ -14,7 +14,7 @@ use vpn_core::{EventBus, LogBuffer, ProfileStore};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// Real tunnels (Windows, elevated).
+    /// Real tunnels (Windows elevated; Linux with CAP_NET_ADMIN).
     Real,
     /// Simulated engine, any OS, no privileges.
     Mock,
@@ -50,6 +50,7 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
                 .map_err(store_io)?,
             );
             let engine = crate::simulate::SimulatedEngine::new(store.clone(), bus.clone());
+            info!(target: "host", endpoint = %ipc_proto::client::endpoint().display(), "listening");
             (engine, store, mock_listener()?, guard)
         }
         Mode::Real => real_parts(&dir, console, &bus, &ring)?,
@@ -69,7 +70,7 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
             .name("ipc-accept".into())
             .spawn(move || run_accept_loop(l, ctx, s))?
     };
-    info!(target: "host", mode = ?mode, endpoint = %ipc_proto::client::endpoint().display(), "service ready");
+    info!(target: "host", mode = ?mode, "service ready");
     Ok(Host {
         engine,
         listener,
@@ -95,6 +96,7 @@ fn mock_listener() -> io::Result<Arc<dyn Listener>> {
 fn mock_listener() -> io::Result<Arc<dyn Listener>> {
     Ok(Arc::new(crate::unix::UnixSocketListener::bind(
         ipc_proto::client::endpoint(),
+        0o600,
     )?))
 }
 
@@ -152,10 +154,90 @@ fn real_parts(
         ipc_proto::client::PIPE_NAME,
         pipe::PIPE_SDDL,
     )?);
+    info!(target: "host", endpoint = ipc_proto::client::PIPE_NAME, "listening");
     Ok((mgr, store, listener, guard))
 }
 
-#[cfg(not(windows))]
+/// Linux (002): TUN over /dev/net/tun, iproute2/resolvectl, machine-key
+/// secrets, and the group-restricted system socket.
+#[cfg(target_os = "linux")]
+fn real_parts(
+    dir: &std::path::Path,
+    console: bool,
+    bus: &EventBus,
+    ring: &LogBuffer,
+) -> io::Result<Parts> {
+    use crate::linux::netconfig::{LinuxNetConfig, SystemRunner};
+    use crate::linux::tun::LinuxTunFactory;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use vpn_core::keyfile::KeyFileProtector;
+    use vpn_core::traits::{FileJournal, StdUdpFactory};
+    use vpn_core::{ConnectionManager, Deps, EngineConfig};
+
+    // systemd's StateDirectory= already creates it 0700; this covers `run`
+    // started by hand as root.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let logs = dir.join("logs");
+    std::fs::create_dir_all(&logs)?;
+    // Console output goes to stdout, which journald captures under systemd.
+    let guard = logging::init(Some(&logs), console, ring);
+    info!(target: "host", version = env!("CARGO_PKG_VERSION"), "starting");
+
+    let tun = Arc::new(LinuxTunFactory);
+    let net = Arc::new(LinuxNetConfig::detect(
+        SystemRunner,
+        std::path::PathBuf::from("/etc/resolv.conf"),
+    ));
+    info!(target: "host", dns = ?net.dns_mode(), "network configuration");
+    let journal = Arc::new(FileJournal {
+        path: dir.join("netstate.json"),
+    });
+    // FR-005: undo whatever a previous unclean exit left behind (the TUN
+    // device itself is already gone; its gateway route and DNS may not be).
+    vpn_core::manager::recover(tun.as_ref(), net.as_ref(), journal.as_ref());
+
+    let store = Arc::new(
+        ProfileStore::open(
+            Some(dir.join("profiles.json")),
+            Arc::new(KeyFileProtector::new(dir.join("secret.key"))),
+        )
+        .map_err(store_io)?,
+    );
+    let mgr = ConnectionManager::start(Deps {
+        udp: Arc::new(StdUdpFactory),
+        tun,
+        net,
+        journal,
+        store: store.clone(),
+        bus: bus.clone(),
+        config: EngineConfig::default(),
+    });
+
+    let socket = paths::socket_path();
+    if let Some(parent) = socket.parent() {
+        // systemd's RuntimeDirectory= (0750, group ipsec-client) normally
+        // exists already.
+        if !parent.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o750)
+                .create(parent)?;
+        }
+    }
+    // 0660: members of the service's group may connect (research R5).
+    let listener = Arc::new(crate::unix::UnixSocketListener::bind(
+        socket.clone(),
+        0o660,
+    )?);
+    info!(target: "host", endpoint = %socket.display(), "listening");
+    Ok((mgr, store, listener, guard))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn real_parts(
     _dir: &std::path::Path,
     _console: bool,
@@ -164,7 +246,7 @@ fn real_parts(
 ) -> io::Result<Parts> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "the real VPN service is only available on Windows in this version; use `run --mock`",
+        "the real VPN service is available on Windows and Linux; use `run --mock`",
     ))
 }
 

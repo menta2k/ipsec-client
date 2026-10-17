@@ -73,10 +73,19 @@ pub struct MockNetConfig {
     pub applied: Mutex<Vec<NetChange>>,
     /// Fail the n-th `apply` call (0-based), to test rollback.
     pub fail_apply_at: Mutex<Option<usize>>,
+    /// When set, `prepare` answers a `Dns` change with a `ResolvConf` backup
+    /// holding this text (the Linux no-resolved path).
+    pub dns_backup: Mutex<Option<String>>,
     applies: AtomicUsize,
 }
 
 impl NetConfig for MockNetConfig {
+    fn prepare(&self, change: &NetChange) -> io::Result<Option<NetChange>> {
+        Ok(match (change, self.dns_backup.lock().unwrap().as_ref()) {
+            (NetChange::Dns { .. }, Some(b)) => Some(NetChange::ResolvConf { backup: b.clone() }),
+            _ => None,
+        })
+    }
     fn apply(&self, change: &NetChange) -> io::Result<()> {
         let n = self.applies.fetch_add(1, Ordering::SeqCst);
         if *self.fail_apply_at.lock().unwrap() == Some(n) {

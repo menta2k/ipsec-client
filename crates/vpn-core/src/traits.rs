@@ -85,6 +85,13 @@ pub enum NetChange {
 }
 
 pub trait NetConfig: Send + Sync {
+    /// Called before `change` is journaled. A platform may return an extra
+    /// change that must be journaled (and applied) first so the original state
+    /// can be restored after a crash, e.g. the `/etc/resolv.conf` backup on
+    /// Linux without systemd-resolved.
+    fn prepare(&self, _change: &NetChange) -> io::Result<Option<NetChange>> {
+        Ok(None)
+    }
     fn apply(&self, change: &NetChange) -> io::Result<()>;
     fn revert(&self, change: &NetChange) -> io::Result<()>;
     /// The interface and next hop the OS currently uses to reach `dest`
