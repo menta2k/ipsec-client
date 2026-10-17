@@ -180,7 +180,7 @@ impl ConnectionManager {
         password: Option<SecretString>,
         save_password: bool,
     ) -> Result<(), RejectError> {
-        let mut state = self.shared.state.lock().unwrap();
+        let state = self.shared.state.lock().unwrap();
         if state.is_active() {
             return Err(RejectError::new(
                 RequestError::AlreadyConnected,
@@ -210,20 +210,89 @@ impl ConnectionManager {
                 "A password is required for this profile",
             ));
         }
+        self.launch(
+            state,
+            ConnectPlan {
+                profile,
+                secrets,
+                password_saved,
+            },
+            "app",
+        )
+    }
+
+    /// Connect from the Windows sign-in screen (003 research R4/R6). The
+    /// profile must be available at sign-in; for EAP the password must be
+    /// typed (a saved one is never used, since anyone at the console can reach
+    /// that screen); for PSK no password is accepted. Nothing is saved.
+    pub fn connect_at_sign_in(
+        &self,
+        id: &str,
+        password: Option<SecretString>,
+    ) -> Result<(), RejectError> {
+        let state = self.shared.state.lock().unwrap();
+        if state.is_active() {
+            return Err(RejectError::new(
+                RequestError::AlreadyConnected,
+                "Already connected",
+            ));
+        }
+        let profile = self
+            .store
+            .get(id)
+            .ok_or_else(|| RejectError::new(RequestError::NotFound, "Profile not found"))?;
+        if !profile.sign_in {
+            return Err(RejectError::new(
+                RequestError::NotAvailableAtSignIn,
+                "This connection is not available at sign-in",
+            ));
+        }
+        let typed = password.filter(|p| !p.is_empty());
+        let mut secrets = self.store.load_secrets(id).map_err(store_reject)?;
+        secrets.password = match (profile.auth, typed) {
+            (AuthMode::Eap, Some(pw)) => Some(Zeroizing::new(pw.expose().to_string())),
+            (AuthMode::Eap, None) => {
+                return Err(RejectError::new(
+                    RequestError::MissingSecret,
+                    "Enter the password for this connection",
+                ))
+            }
+            (AuthMode::Psk, Some(_)) => {
+                return Err(RejectError::new(
+                    RequestError::Invalid,
+                    "This connection does not use a password",
+                ))
+            }
+            (AuthMode::Psk, None) => None,
+        };
+        self.launch(
+            state,
+            ConnectPlan {
+                profile,
+                secrets,
+                // A typed one-shot password: never reconnect unattended with it.
+                password_saved: false,
+            },
+            "sign_in_screen",
+        )
+    }
+
+    /// Enter Connecting and hand the plan to the worker.
+    fn launch(
+        &self,
+        mut state: std::sync::MutexGuard<'_, ConnectionState>,
+        plan: ConnectPlan,
+        origin: &'static str,
+    ) -> Result<(), RejectError> {
         self.shared.cancel.store(false, Ordering::SeqCst);
         let new_state = ConnectionState::Connecting {
-            profile_id: profile.id.clone(),
+            profile_id: plan.profile.id.clone(),
             attempt: 1,
         };
         *state = new_state.clone();
         drop(state);
-        info!(target: TARGET, profile = %profile.name, "connect requested");
+        info!(target: TARGET, profile = %plan.profile.name, origin, "connect requested");
         self.shared.bus.publish(Event::State { state: new_state });
-        let plan = ConnectPlan {
-            profile,
-            secrets,
-            password_saved,
-        };
         self.cmd_tx
             .lock()
             .unwrap()

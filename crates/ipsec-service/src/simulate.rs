@@ -67,6 +67,40 @@ impl Engine for SimulatedEngine {
         }
     }
 
+    fn connect_at_sign_in(
+        &self,
+        id: &str,
+        password: Option<SecretString>,
+    ) -> Result<(), RejectError> {
+        // Same rules as the real engine (003 research R6), then the usual
+        // simulated walk with only the typed password.
+        let p = self.store.get(id).ok_or(RejectError {
+            code: RequestError::NotFound,
+            message: "Profile not found".into(),
+        })?;
+        if !p.sign_in {
+            return Err(RejectError {
+                code: RequestError::NotAvailableAtSignIn,
+                message: "This connection is not available at sign-in".into(),
+            });
+        }
+        let typed = password.filter(|p| !p.is_empty());
+        match (p.auth, &typed) {
+            (AuthMode::Eap, None) => Err(RejectError {
+                code: RequestError::MissingSecret,
+                message: "Enter the password for this connection".into(),
+            }),
+            (AuthMode::Psk, Some(_)) => Err(RejectError {
+                code: RequestError::Invalid,
+                message: "This connection does not use a password".into(),
+            }),
+            _ => {
+                info!(target: "simulate", origin = "sign_in_screen", "connect at sign-in");
+                self.connect(id, typed, false)
+            }
+        }
+    }
+
     fn connect(
         &self,
         id: &str,

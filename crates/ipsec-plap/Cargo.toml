@@ -1,0 +1,25 @@
+[package]
+name = "ipsec-plap"
+description = "Pre-Login Connect: the Network sign-in provider (PLAP) loaded by the Windows sign-in screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the DLL LogonUI loads; rlib: lets the tests and harness link the logic.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ipc-proto.workspace = true
+zeroize.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# COM interfaces and #[implement] for the credential provider (003 research R1).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+] }
+windows-core = "0.62"

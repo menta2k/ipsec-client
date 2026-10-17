@@ -40,6 +40,7 @@ struct Harness {
     events: Receiver<Event>,
     resp: MockResponder,
     profile_id: String,
+    store: Arc<ProfileStore>,
 }
 
 fn harness(rcfg: ResponderConfig, edit: impl FnOnce(&mut ProfileEdit)) -> Harness {
@@ -94,7 +95,7 @@ fn harness_with(
         tun: tun.clone(),
         net: net.clone(),
         journal: journal.clone(),
-        store,
+        store: store.clone(),
         bus,
         config,
     });
@@ -106,6 +107,7 @@ fn harness_with(
         events,
         resp,
         profile_id,
+        store,
     }
 }
 
@@ -475,6 +477,81 @@ fn prepared_backup_is_journaled_before_dns_and_reverted_last() {
             "{what}: backup must come right before DNS: {list:?}"
         );
     }
+    h.mgr.disconnect().unwrap();
+    h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
+    h.assert_clean();
+}
+
+// ------------------------------------------------- 003 Pre-Login Connect
+
+fn reject_code(r: Result<(), vpn_core::RejectError>) -> ipc_proto::RequestError {
+    r.expect_err("expected a rejection").code
+}
+
+#[test]
+fn sign_in_connect_never_uses_the_saved_password() {
+    let h = harness(ResponderConfig::default(), |e| {
+        e.password = SecretUpdate::Set(SecretString::new(PASSWORD));
+    });
+    h.store.set_sign_in(&h.profile_id, true).unwrap();
+
+    // Saved password present, none typed: refused (FR-003).
+    assert_eq!(
+        reject_code(h.mgr.connect_at_sign_in(&h.profile_id, None)),
+        ipc_proto::RequestError::MissingSecret
+    );
+    // A wrong typed password fails even though the right one is saved.
+    h.mgr
+        .connect_at_sign_in(&h.profile_id, Some(SecretString::new("wrong")))
+        .unwrap();
+    assert_eq!(h.wait_error(), ErrorCode::UserAuthFailed);
+    h.assert_clean();
+
+    h.mgr
+        .connect_at_sign_in(&h.profile_id, Some(SecretString::new(PASSWORD)))
+        .unwrap();
+    h.wait_connected();
+    h.mgr.disconnect().unwrap();
+    h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
+    h.assert_clean();
+}
+
+#[test]
+fn sign_in_connect_requires_the_profile_to_be_available() {
+    let h = harness(ResponderConfig::default(), |_| {});
+    assert_eq!(
+        reject_code(
+            h.mgr
+                .connect_at_sign_in(&h.profile_id, Some(SecretString::new(PASSWORD)))
+        ),
+        ipc_proto::RequestError::NotAvailableAtSignIn
+    );
+    assert_eq!(
+        reject_code(h.mgr.connect_at_sign_in("missing", None)),
+        ipc_proto::RequestError::NotFound
+    );
+}
+
+#[test]
+fn sign_in_connect_psk_takes_no_password() {
+    let h = harness(ResponderConfig::default(), |e| {
+        e.auth = AuthMode::Psk;
+        e.username.clear();
+    });
+    h.store.set_sign_in(&h.profile_id, true).unwrap();
+    assert_eq!(
+        reject_code(
+            h.mgr
+                .connect_at_sign_in(&h.profile_id, Some(SecretString::new("x")))
+        ),
+        ipc_proto::RequestError::Invalid
+    );
+    h.mgr.connect_at_sign_in(&h.profile_id, None).unwrap();
+    h.wait_connected();
+    assert_eq!(
+        reject_code(h.mgr.connect_at_sign_in(&h.profile_id, None)),
+        ipc_proto::RequestError::AlreadyConnected
+    );
     h.mgr.disconnect().unwrap();
     h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
     h.assert_clean();

@@ -1,7 +1,7 @@
 //! Unix-domain-socket listener: mode 0600 for the per-user mock socket, 0660
 //! for the Linux system service (members of its group may connect).
 
-use crate::server::Listener;
+use crate::server::{Listener, Peer};
 use ipc_proto::client::Stream;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -29,12 +29,13 @@ impl UnixSocketListener {
 }
 
 impl Listener for UnixSocketListener {
-    fn accept(&self) -> io::Result<Box<dyn Stream>> {
+    fn accept(&self) -> io::Result<(Box<dyn Stream>, Peer)> {
         let (s, _) = self.listener.accept()?;
         if self.closed.load(Ordering::SeqCst) {
             return Err(io::Error::other("listener closed"));
         }
-        Ok(Box::new(s))
+        // Peer credentials (SO_PEERCRED) are added with 002 T024.
+        Ok((Box::new(s), Peer::default()))
     }
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);

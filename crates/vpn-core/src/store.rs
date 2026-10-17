@@ -2,7 +2,7 @@
 
 use crate::profile::{validate, FieldError, Profile};
 use crate::traits::SecretProtector;
-use ipc_proto::{AuthMode, ProfileEdit, ProfileView, SecretUpdate};
+use ipc_proto::{AuthMode, ProfileEdit, ProfileView, SecretUpdate, SignInProfile};
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,7 @@ impl ProfileStore {
             auto_reconnect: false,
             psk_blob: None,
             password_blob: None,
+            sign_in: false,
         };
         p.apply_fields(edit);
         self.apply_secret(&mut p.psk_blob, &edit.psk)?;
@@ -147,6 +148,48 @@ impl ProfileStore {
         list[idx] = p;
         self.persist(&list)?;
         Ok(view)
+    }
+
+    /// Make a profile available (or not) at the sign-in screen (003). The
+    /// caller is responsible for the administrator check.
+    pub fn set_sign_in(&self, id: &str, enabled: bool) -> Result<ProfileView, StoreError> {
+        let mut list = self.profiles.lock().unwrap();
+        let p = list
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or(StoreError::NotFound)?;
+        p.sign_in = enabled;
+        let view = p.view();
+        self.persist(&list)?;
+        Ok(view)
+    }
+
+    /// Profiles offered at the sign-in screen, in their minimal form.
+    pub fn sign_in_profiles(&self) -> Vec<SignInProfile> {
+        self.profiles
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.sign_in)
+            .map(Profile::sign_in_view)
+            .collect()
+    }
+
+    /// Unattended deployment (003): update the profile with the same name
+    /// (case-insensitive) or create it, then set its sign-in availability.
+    pub fn import(&self, edit: &ProfileEdit, sign_in: bool) -> Result<ProfileView, StoreError> {
+        let existing = self
+            .profiles
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(edit.name.trim()))
+            .map(|p| p.id.clone());
+        let view = match existing {
+            Some(id) => self.update(&id, edit)?,
+            None => self.create(edit)?,
+        };
+        self.set_sign_in(&view.id, sign_in)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), StoreError> {
@@ -307,7 +350,7 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::mock::InsecureMockProtector;
-    use ipc_proto::SecretString;
+    use ipc_proto::{SecretString, SignInProfile};
 
     fn edit(name: &str) -> ProfileEdit {
         ProfileEdit {
@@ -377,6 +420,80 @@ mod tests {
         assert!(matches!(
             psk_lost.load_secrets(&id),
             Err(StoreError::MissingSecret(_))
+        ));
+    }
+
+    #[test]
+    fn sign_in_flag_defaults_off_for_001_files() {
+        let path = temp_path("signin001");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"profiles":[{"id":"p1","name":"Old","gateway":"g","port":500,
+               "local_id":"l","id_type":"fqdn","dh_group":"modp2048","auth":"psk"}]}"#,
+        )
+        .unwrap();
+        let store = ProfileStore::open(Some(path), Arc::new(InsecureMockProtector)).unwrap();
+        assert!(!store.list()[0].sign_in);
+        assert!(store.sign_in_profiles().is_empty());
+    }
+
+    #[test]
+    fn sign_in_flag_persists_survives_edits_and_lists_minimal_view() {
+        let path = temp_path("signin");
+        let prot = Arc::new(InsecureMockProtector);
+        let store = ProfileStore::open(Some(path.clone()), prot.clone()).unwrap();
+        let office = store.create(&edit("Office")).unwrap();
+        store.create(&edit("Home")).unwrap();
+
+        let v = store.set_sign_in(&office.id, true).unwrap();
+        assert!(v.sign_in);
+        assert!(matches!(
+            store.set_sign_in("nope", true),
+            Err(StoreError::NotFound)
+        ));
+
+        // A normal edit (rename) keeps the flag.
+        let mut renamed = edit("Office HQ");
+        renamed.psk = SecretUpdate::Keep;
+        renamed.password = SecretUpdate::Keep;
+        assert!(store.update(&office.id, &renamed).unwrap().sign_in);
+
+        let reopened = ProfileStore::open(Some(path), prot).unwrap();
+        assert_eq!(
+            reopened.sign_in_profiles(),
+            vec![SignInProfile {
+                id: office.id.clone(),
+                name: "Office HQ".into(),
+                auth: AuthMode::Eap,
+                username: "alice".into(),
+            }]
+        );
+
+        reopened.delete(&office.id).unwrap();
+        assert!(reopened.sign_in_profiles().is_empty());
+    }
+
+    #[test]
+    fn import_creates_or_updates_by_name_and_sets_the_flag() {
+        let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+        let created = store.import(&edit("Office"), true).unwrap();
+        assert!(created.sign_in);
+        assert_eq!(store.list().len(), 1);
+
+        let mut again = edit("office");
+        again.gateway = "vpn2.example.com".into();
+        let updated = store.import(&again, false).unwrap();
+        assert_eq!(updated.id, created.id, "matched case-insensitively");
+        assert_eq!(updated.gateway, "vpn2.example.com");
+        assert!(!updated.sign_in);
+        assert_eq!(store.list().len(), 1);
+
+        let mut bad = edit("Broken");
+        bad.gateway = String::new();
+        assert!(matches!(
+            store.import(&bad, true),
+            Err(StoreError::Invalid(_))
         ));
     }
 

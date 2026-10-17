@@ -6,6 +6,7 @@ members = [
     "crates/vpn-core",
     "crates/ipsec-service",
     "crates/ipsec-gui",
+    "crates/ipsec-plap",
 ]
 
 [workspace.package]

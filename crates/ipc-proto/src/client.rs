@@ -20,12 +20,17 @@ pub const SYSTEM_SOCKET: &str = "/run/ipsec-client/ipsec-client.sock";
 /// Environment variable that overrides the system socket (tests, developers).
 pub const SOCKET_ENV: &str = "IPSEC_CLIENT_SOCKET";
 
+/// Environment variable that overrides the Windows pipe name for tests (003
+/// research R3/R9). The installed service never reads it, and LogonUI's
+/// environment is fixed by the system, so it cannot redirect real clients.
+pub const PIPE_ENV: &str = "IPSEC_CLIENT_PIPE";
+
 /// The per-user endpoint: the named pipe on Windows; on Unix the socket the
 /// mock service (`run --mock`) listens on.
 pub fn endpoint() -> PathBuf {
     #[cfg(windows)]
     {
-        PathBuf::from(PIPE_NAME)
+        windows_pipe(&|k| std::env::var_os(k))
     }
     #[cfg(not(windows))]
     {
@@ -63,6 +68,12 @@ impl Os {
 
 type Env<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
 
+fn windows_pipe(env: Env<'_>) -> PathBuf {
+    env(PIPE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(PIPE_NAME))
+}
+
 fn user_socket(env: Env<'_>, tmp: &std::path::Path) -> PathBuf {
     if let Some(dir) = env("XDG_RUNTIME_DIR") {
         return PathBuf::from(dir).join("ipsec-client.sock");
@@ -82,7 +93,7 @@ fn endpoint_candidates(
     tmp: &std::path::Path,
 ) -> Vec<PathBuf> {
     match os {
-        Os::Windows => vec![PathBuf::from(PIPE_NAME)],
+        Os::Windows => vec![windows_pipe(&env)],
         Os::Linux => {
             let mut v: Vec<PathBuf> = env(SOCKET_ENV).map(PathBuf::from).into_iter().collect();
             v.push(PathBuf::from(SYSTEM_SOCKET));
@@ -445,6 +456,20 @@ mod tests {
                 PathBuf::from("/tmp/ipsec-client-bob.sock"),
             ]
         );
+    }
+
+    #[test]
+    fn windows_pipe_can_be_overridden_for_tests() {
+        let tmp = PathBuf::from("/tmp");
+        let win = endpoint_candidates(
+            Os::Windows,
+            env(&[("IPSEC_CLIENT_PIPE", r"\\.\pipe\IpsecClient.test.7")]),
+            &tmp,
+        );
+        assert_eq!(win, [PathBuf::from(r"\\.\pipe\IpsecClient.test.7")]);
+        // The pipe override means nothing on Linux.
+        let lin = endpoint_candidates(Os::Linux, env(&[("IPSEC_CLIENT_PIPE", "/x")]), &tmp);
+        assert!(!lin.contains(&PathBuf::from("/x")));
     }
 
     #[test]

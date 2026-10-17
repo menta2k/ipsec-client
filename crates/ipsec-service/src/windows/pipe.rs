@@ -10,7 +10,7 @@
 //! see "no instance". Each connected instance becomes a `std::fs::File`.
 
 use super::{wide, SecurityDescriptor};
-use crate::server::Listener;
+use crate::server::{Listener, Peer};
 use ipc_proto::client::Stream;
 use std::fs::File;
 use std::io;
@@ -90,7 +90,7 @@ impl PipeListener {
 }
 
 impl Listener for PipeListener {
-    fn accept(&self) -> io::Result<Box<dyn Stream>> {
+    fn accept(&self) -> io::Result<(Box<dyn Stream>, Peer)> {
         let h = match self.pending.lock().unwrap().take() {
             Some(h) => h,
             None => self.create_instance(false)?,
@@ -113,8 +113,10 @@ impl Listener for PipeListener {
         if let Ok(next) = self.create_instance(false) {
             *self.pending.lock().unwrap() = Some(next);
         }
+        // OS-attested client identity for administrator-only requests.
+        let peer = super::peer::pipe_peer(h.0);
         // SAFETY: ownership of the connected handle moves into the File.
-        Ok(Box::new(unsafe { File::from_raw_handle(h.0 as _) }))
+        Ok((Box::new(unsafe { File::from_raw_handle(h.0 as _) }), peer))
     }
 
     fn close(&self) {

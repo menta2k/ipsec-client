@@ -56,9 +56,14 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
         Mode::Real => real_parts(&dir, console, &bus, &ring)?,
     };
 
+    let (settings, problem) = vpn_core::SettingsStore::open(dir.join("settings.json"));
+    if let Some(e) = problem {
+        tracing::warn!(target: "host", error = %e, "settings unreadable; using defaults");
+    }
     let ctx = Arc::new(ServerCtx {
         engine: engine.clone(),
         store,
+        settings: Arc::new(settings),
         bus,
         logs: ring,
         service_name: format!("ipsec-service {}", env!("CARGO_PKG_VERSION")),
@@ -83,7 +88,10 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
 #[cfg(windows)]
 fn mock_listener() -> io::Result<Arc<dyn Listener>> {
     use crate::windows::pipe::{PipeListener, PIPE_SDDL};
-    let l = PipeListener::bind(ipc_proto::client::PIPE_NAME, PIPE_SDDL).map_err(|e| {
+    // `endpoint()` honours IPSEC_CLIENT_PIPE so tests can run beside an
+    // installed service.
+    let pipe = ipc_proto::client::endpoint();
+    let l = PipeListener::bind(&pipe.to_string_lossy(), PIPE_SDDL).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("cannot open the IPC pipe (is the real service running?): {e}"),

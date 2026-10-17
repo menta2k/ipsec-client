@@ -19,10 +19,12 @@ pub mod mock;
 pub mod profile;
 pub mod routes;
 pub mod session;
+pub mod settings;
 pub mod store;
 pub mod traits;
 
 pub use events::EventBus;
 pub use logbuf::LogBuffer;
 pub use manager::{ConnectionManager, Deps, EngineConfig, RejectError};
+pub use settings::SettingsStore;
 pub use store::ProfileStore;

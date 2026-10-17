@@ -100,6 +100,33 @@ pub enum Request {
         max: u32,
     },
     Subscribe,
+    // --- Pre-Login Connect (003 contracts/ipc-additions.md); additive. ---
+    /// Profiles an administrator made available at the sign-in screen.
+    ListSignInProfiles,
+    /// Connect from the sign-in screen: the profile must be available at
+    /// sign-in, a saved password is never used, and nothing is saved.
+    ConnectAtSignIn {
+        id: String,
+        #[serde(default)]
+        password: Option<SecretString>,
+    },
+    /// Administrator only.
+    SetSignIn {
+        id: String,
+        enabled: bool,
+    },
+    GetPolicy,
+    /// Administrator only.
+    SetPolicy {
+        policy: Policy,
+    },
+    /// Administrator only: create or update (by name) for unattended
+    /// deployment.
+    ImportProfile {
+        profile: ProfileEdit,
+        #[serde(default)]
+        sign_in: bool,
+    },
 }
 
 /// Service -> client responses (exactly one per request).
@@ -129,6 +156,12 @@ pub enum Response {
         code: RequestError,
         message: String,
     },
+    SignInProfiles {
+        profiles: Vec<SignInProfile>,
+    },
+    Policy {
+        policy: Policy,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +173,10 @@ pub enum RequestError {
     MissingSecret,
     NameTaken,
     Internal,
+    /// The request needs an elevated administrator (003).
+    AdminRequired,
+    /// The profile is not available at the sign-in screen (003).
+    NotAvailableAtSignIn,
 }
 
 /// Service -> subscribed client events.
@@ -281,6 +318,27 @@ pub struct ProfileView {
     pub auto_reconnect: bool,
     pub has_psk: bool,
     pub has_password: bool,
+    /// Offered at the Windows sign-in screen (003); set by administrators only.
+    #[serde(default)]
+    pub sign_in: bool,
+}
+
+/// All the sign-in screen learns about a profile (003 data-model.md): no
+/// gateway, and deliberately no hint whether secrets are saved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInProfile {
+    pub id: String,
+    pub name: String,
+    pub auth: AuthMode,
+    pub username: String,
+}
+
+/// Machine-wide Pre-Login Connect policy (003).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// Keep the tunnel when the user signs out of Windows (default: disconnect).
+    #[serde(default)]
+    pub keep_tunnel_on_signout: bool,
 }
 
 /// How to change a stored secret.
@@ -366,6 +424,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!((s.dropped_out, s.filtered_out), (6, 0));
+    }
+
+    #[test]
+    fn sign_in_requests_and_responses_round_trip() {
+        let frames = [
+            Frame::Request {
+                body: Request::ListSignInProfiles,
+            },
+            Frame::Request {
+                body: Request::ConnectAtSignIn {
+                    id: "a".into(),
+                    password: Some(SecretString::new("pw")),
+                },
+            },
+            Frame::Request {
+                body: Request::ConnectAtSignIn {
+                    id: "a".into(),
+                    password: None,
+                },
+            },
+            Frame::Request {
+                body: Request::SetSignIn {
+                    id: "a".into(),
+                    enabled: true,
+                },
+            },
+            Frame::Request {
+                body: Request::GetPolicy,
+            },
+            Frame::Request {
+                body: Request::SetPolicy {
+                    policy: Policy {
+                        keep_tunnel_on_signout: true,
+                    },
+                },
+            },
+            Frame::Request {
+                body: Request::ImportProfile {
+                    profile: ProfileEdit {
+                        name: "Office".into(),
+                        ..Default::default()
+                    },
+                    sign_in: true,
+                },
+            },
+            Frame::Response {
+                body: Response::SignInProfiles {
+                    profiles: vec![SignInProfile {
+                        id: "a".into(),
+                        name: "Office".into(),
+                        auth: AuthMode::Eap,
+                        username: "alice".into(),
+                    }],
+                },
+            },
+            Frame::Response {
+                body: Response::Policy {
+                    policy: Policy::default(),
+                },
+            },
+            Frame::Response {
+                body: Response::Failed {
+                    code: RequestError::AdminRequired,
+                    message: "x".into(),
+                },
+            },
+            Frame::Response {
+                body: Response::Failed {
+                    code: RequestError::NotAvailableAtSignIn,
+                    message: "x".into(),
+                },
+            },
+        ];
+        for f in &frames {
+            rt(f);
+        }
+    }
+
+    #[test]
+    fn sign_in_profile_exposes_only_name_auth_and_username() {
+        let v = serde_json::to_value(SignInProfile {
+            id: "i".into(),
+            name: "n".into(),
+            auth: AuthMode::Psk,
+            username: "u".into(),
+        })
+        .unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["auth", "id", "name", "username"]);
+    }
+
+    #[test]
+    fn profile_view_from_001_parses_with_sign_in_false() {
+        let mut v = serde_json::to_value(ProfileView::default()).unwrap();
+        v.as_object_mut().unwrap().remove("sign_in");
+        let back: ProfileView = serde_json::from_value(v).unwrap();
+        assert!(!back.sign_in);
+    }
+
+    #[test]
+    fn policy_defaults_to_disconnect_on_signout() {
+        assert!(!Policy::default().keep_tunnel_on_signout);
+        let p: Policy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p, Policy::default());
     }
 
     fn rt(f: &Frame) {

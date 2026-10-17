@@ -1804,6 +1804,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipsec-plap"
+version = "0.1.0"
+dependencies = [
+ "ipc-proto",
+ "tracing",
+ "windows",
+ "windows-core",
+ "zeroize",
+]
+
+[[package]]
 name = "ipsec-service"
 version = "0.1.0"
 dependencies = [

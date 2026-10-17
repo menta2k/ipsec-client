@@ -1,7 +1,7 @@
 //! Connection profiles: persisted form, validation (data-model.md) and the
 //! secret-free IPC view.
 
-use ipc_proto::{AuthMode, DhGroupSel, IdType, ProfileEdit, ProfileView};
+use ipc_proto::{AuthMode, DhGroupSel, IdType, ProfileEdit, ProfileView, SignInProfile};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -25,6 +25,10 @@ pub struct Profile {
     pub psk_blob: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_blob: Option<String>,
+    /// Offered at the Windows sign-in screen (003). Changed only through
+    /// administrator requests, never by a normal edit.
+    #[serde(default)]
+    pub sign_in: bool,
 }
 
 impl Profile {
@@ -42,6 +46,17 @@ impl Profile {
             auto_reconnect: self.auto_reconnect,
             has_psk: self.psk_blob.is_some(),
             has_password: self.password_blob.is_some(),
+            sign_in: self.sign_in,
+        }
+    }
+
+    /// The minimal view the sign-in screen gets (003).
+    pub fn sign_in_view(&self) -> SignInProfile {
+        SignInProfile {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            auth: self.auth,
+            username: self.username.clone(),
         }
     }
 

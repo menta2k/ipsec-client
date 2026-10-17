@@ -4,6 +4,7 @@
 pub mod dpapi;
 pub mod eventlog;
 pub mod netconfig;
+pub mod peer;
 pub mod pipe;
 pub mod service;
 pub mod wintun_tun;
