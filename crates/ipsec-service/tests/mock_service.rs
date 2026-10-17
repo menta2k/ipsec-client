@@ -30,9 +30,9 @@ impl Service {
     }
 }
 
-/// Start `run --mock`. On Windows it gets a private pipe name (003 T010), so
-/// the test runs even next to an installed service. On Unix the per-user
-/// socket is used; skip if something already listens there.
+/// Start `run --mock` on a private endpoint (a pipe name on Windows, a socket
+/// path on Unix), so tests never collide with each other or with an installed
+/// service.
 fn start(tag: &str) -> Option<Service> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ipsec-service"));
     cmd.args(["run", "--mock"])
@@ -43,11 +43,8 @@ fn start(tag: &str) -> Option<Service> {
         cmd.env(ipc_proto::client::PIPE_ENV, &pipe);
         PathBuf::from(pipe)
     } else {
-        let p = ipc_proto::client::endpoint();
-        if connect_stream_at(&p).is_ok() {
-            eprintln!("a mock service is already running; skipping");
-            return None;
-        }
+        let p = std::env::temp_dir().join(format!("ipsec-mock-{}-{tag}.sock", std::process::id()));
+        cmd.env(ipc_proto::client::SOCKET_ENV, &p);
         p
     };
     let svc = Service {
@@ -193,4 +190,28 @@ fn admin_requests_follow_the_client_token() {
         c.request(Request::GetPolicy).unwrap(),
         Response::Policy { .. }
     ));
+}
+
+/// 002 T019: `systemctl stop` sends SIGTERM; the service must take the same
+/// clean path as Ctrl-C (tear down, revert, exit 0).
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_the_service_cleanly() {
+    let Some(mut svc) = start("term") else { return };
+    let pid = svc.child.id().to_string();
+    let sent = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("run kill");
+    assert!(sent.success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = svc.child.try_wait().expect("wait") {
+            assert!(status.success(), "exit status after SIGTERM: {status:?}");
+            assert!(!svc.endpoint.exists(), "socket removed on clean stop");
+            return;
+        }
+        assert!(Instant::now() < deadline, "no exit within 5 s of SIGTERM");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

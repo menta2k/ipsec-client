@@ -1,0 +1,37 @@
+# IPsec VPN client service (feature 002, contracts/linux-system-integration.md).
+# Runs unprivileged as ipsec-client with only the two capabilities it needs.
+
+[Unit]
+Description=IPsec VPN Client Service
+Documentation=file:///usr/share/doc/ipsec-client/README.md
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ipsec-service run
+User=ipsec-client
+Group=ipsec-client
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+StateDirectory=ipsec-client
+StateDirectoryMode=0700
+RuntimeDirectory=ipsec-client
+RuntimeDirectoryMode=0750
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

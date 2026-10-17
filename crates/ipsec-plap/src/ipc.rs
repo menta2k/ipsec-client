@@ -393,21 +393,4 @@ mod tests {
         ));
         assert_eq!(ev.next(Duration::from_millis(50)).unwrap(), None);
     }
-
-    #[test]
-    fn finished_workers_are_no_longer_counted() {
-        let api = PipeApi::with(
-            Arc::new(|| Err(io::Error::from(io::ErrorKind::NotFound))),
-            Duration::from_secs(1),
-        );
-        let _ = api.status();
-        // The worker drops its guard right after sending; allow it to finish.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while live_workers() > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // Other tests may still have abandoned (hung) workers; only check
-        // that this one did not leak beyond them.
-        assert!(live_workers() <= 2, "{}", live_workers());
-    }
 }

@@ -32,10 +32,21 @@ pub enum UiMsg {
     Online(Snapshot),
     /// The service is not reachable.
     Offline(String),
+    /// The service is running but this user may not control it (002 FR-017).
+    Unauthorized,
     /// Client/service protocol versions differ.
     Incompatible(String),
     Event(Event),
     Reply(Tag, Result<Response, String>),
+}
+
+/// What the UI shows when the service cannot be used.
+pub fn link_message(e: &ClientError) -> UiMsg {
+    match e {
+        ClientError::VersionMismatch { .. } => UiMsg::Incompatible(e.to_string()),
+        ClientError::Unauthorized => UiMsg::Unauthorized,
+        _ => UiMsg::Offline(e.to_string()),
+    }
 }
 
 pub struct Backend {
@@ -95,20 +106,21 @@ fn event_loop(tx: Sender<UiMsg>, wake: Wake) {
                     }
                 }
             }
-            Err(e @ ClientError::VersionMismatch { .. }) => {
-                if tx.send(UiMsg::Incompatible(e.to_string())).is_err() {
-                    return;
-                }
-                wake();
-                std::thread::sleep(Duration::from_secs(10));
-            }
             Err(e) => {
-                if tx.send(UiMsg::Offline(e.to_string())).is_err() {
+                let msg = link_message(&e);
+                let incompatible = matches!(msg, UiMsg::Incompatible(_));
+                if tx.send(msg).is_err() {
                     return;
                 }
                 wake();
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(5));
+                if incompatible {
+                    std::thread::sleep(Duration::from_secs(10));
+                } else {
+                    // Offline or not authorized: keep retrying (a group
+                    // membership or a service start may fix it).
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
             }
         }
     }
@@ -144,4 +156,46 @@ fn run(client: &mut Option<CommandClient>, req: Request) -> Result<Response, Cli
         *client = Some(CommandClient::connect(CLIENT_NAME)?);
     }
     client.as_mut().expect("client").request(req)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_failures_map_to_the_right_banner() {
+        assert!(matches!(
+            link_message(&ClientError::Unauthorized),
+            UiMsg::Unauthorized
+        ));
+        assert!(matches!(
+            link_message(&ClientError::VersionMismatch {
+                service: 2,
+                client: 1
+            }),
+            UiMsg::Incompatible(_)
+        ));
+        assert!(matches!(
+            link_message(&ClientError::Unavailable(std::io::Error::from(
+                std::io::ErrorKind::NotFound
+            ))),
+            UiMsg::Offline(_)
+        ));
+    }
+
+    #[test]
+    fn unauthorized_text_says_how_access_is_granted() {
+        let t = crate::app::UNAUTHORIZED_TEXT;
+        assert!(t.contains("not allowed to control the VPN"), "{t}");
+        if cfg!(target_os = "linux") {
+            assert!(
+                t.contains("'ipsec-client' group") && t.contains("log in again"),
+                "{t}"
+            );
+        }
+        assert!(
+            !t.contains("not running"),
+            "must not look like an outage: {t}"
+        );
+    }
 }

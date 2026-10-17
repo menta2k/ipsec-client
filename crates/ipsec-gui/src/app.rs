@@ -23,7 +23,17 @@ pub enum ServiceLink {
     Online,
     Offline(String),
     Incompatible(String),
+    /// Running, but this user may not control it (002 FR-017).
+    Unauthorized,
 }
+
+/// Banner for a user without access. It must not read like an outage.
+pub const UNAUTHORIZED_TEXT: &str = if cfg!(target_os = "linux") {
+    "You are not allowed to control the VPN. Ask an administrator to add you to the \
+     'ipsec-client' group, then log in again."
+} else {
+    "You are not allowed to control the VPN on this computer. Ask an administrator for access."
+};
 
 /// Pending password prompt for an EAP profile without a saved password.
 pub struct PasswordPrompt {
@@ -177,6 +187,15 @@ impl App {
                 self.session = None;
                 self.refresh_tray();
             }
+            UiMsg::Unauthorized => {
+                // No profile, status or log data for users without access.
+                self.link = ServiceLink::Unauthorized;
+                self.state = ConnectionState::Disconnected;
+                self.session = None;
+                self.profiles.clear();
+                self.logs.clear();
+                self.refresh_tray();
+            }
             UiMsg::Incompatible(m) => self.link = ServiceLink::Incompatible(m),
             UiMsg::Event(Event::State { state }) => self.on_state(state),
             UiMsg::Event(Event::Session { session }) => self.session = Some(session),
@@ -246,6 +265,7 @@ impl App {
                 egui::Color32::from_rgb(0xd6, 0x3a, 0x3a),
             ),
             ServiceLink::Incompatible(m) => (format!("Client and service versions are incompatible: {m}"), egui::Color32::from_rgb(0xd6, 0x3a, 0x3a)),
+            ServiceLink::Unauthorized => (UNAUTHORIZED_TEXT.to_string(), egui::Color32::from_rgb(0xe8, 0xa3, 0x17)),
         };
         egui::Frame::new()
             .fill(color.gamma_multiply(0.15))

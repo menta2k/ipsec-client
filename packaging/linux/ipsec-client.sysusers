@@ -1,0 +1,4 @@
+# systemd-sysusers: the group whose members may control the VPN, and the
+# unprivileged account the service runs as (002 research R5/R7).
+g ipsec-client -
+u ipsec-client -:ipsec-client "IPsec VPN client service" - -

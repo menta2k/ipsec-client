@@ -86,7 +86,7 @@ fn run_console(mode: Mode) -> i32 {
     0
 }
 
-#[allow(dead_code)]
+#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
 enum Manage {
     Install,
     Uninstall,
@@ -119,9 +119,35 @@ fn manage(what: &str, m: Manage) -> i32 {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: wrappers around systemctl (002 contracts/service-cli-linux.md).
+#[cfg(target_os = "linux")]
+fn manage(what: &str, m: Manage) -> i32 {
+    use linux::systemd::{run, unit_installed, Verb};
+    let verb = match m {
+        Manage::Install => Verb::Install,
+        Manage::Uninstall => Verb::Uninstall,
+        Manage::Start => Verb::Start,
+        Manage::Stop => Verb::Stop,
+    };
+    match run(verb, &linux::netconfig::SystemRunner, unit_installed()) {
+        Ok(()) => {
+            println!("{what}: ok");
+            0
+        }
+        Err(e) => {
+            if e.code == 5 {
+                eprintln!("{what}: access denied (run with sudo): {}", e.message);
+            } else {
+                eprintln!("{what}: {}", e.message);
+            }
+            e.code
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn manage(what: &str, _m: Manage) -> i32 {
-    eprintln!("{what}: the service can only be installed on Windows in this version");
+    eprintln!("{what}: the service can be installed on Windows and Linux only");
     1
 }
 
@@ -147,9 +173,34 @@ fn cleanup() -> i32 {
     0
 }
 
-#[cfg(not(windows))]
+/// Linux: replay and clear the change journal without starting a session.
+/// The TUN device itself is never left behind (it is not persistent).
+#[cfg(target_os = "linux")]
 fn cleanup() -> i32 {
-    eprintln!("cleanup: only available on Windows");
+    let dir = paths::data_dir(false);
+    let journal_path = dir.join("netstate.json");
+    if let Err(e) = std::fs::metadata(&journal_path) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "cleanup: access denied to {} (run with sudo)",
+                dir.display()
+            );
+            return 5;
+        }
+    }
+    let journal = vpn_core::traits::FileJournal { path: journal_path };
+    let net = linux::netconfig::LinuxNetConfig::detect(
+        linux::netconfig::SystemRunner,
+        std::path::PathBuf::from("/etc/resolv.conf"),
+    );
+    vpn_core::manager::recover(&linux::tun::LinuxTunFactory, &net, &journal);
+    println!("cleanup: ok");
+    0
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn cleanup() -> i32 {
+    eprintln!("cleanup: available on Windows and Linux only");
     1
 }
 
@@ -166,6 +217,6 @@ fn service_entry() -> i32 {
 
 #[cfg(not(windows))]
 fn service_entry() -> i32 {
-    eprintln!("service: only available on Windows");
-    1
+    eprintln!("service: not used on this system; use `run` (the service manager supervises it)");
+    2
 }

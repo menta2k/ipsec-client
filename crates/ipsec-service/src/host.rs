@@ -51,7 +51,7 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
                 .map_err(store_io)?,
             );
             let engine = crate::simulate::SimulatedEngine::new(store.clone(), bus.clone());
-            info!(target: "host", endpoint = %ipc_proto::client::endpoint().display(), "listening");
+            info!(target: "host", endpoint = %mock_endpoint().display(), "listening");
             (engine, store, mock_listener()?, guard)
         }
         Mode::Real => real_parts(&dir, console, &bus, &ring)?,
@@ -103,10 +103,24 @@ fn mock_listener() -> io::Result<Arc<dyn Listener>> {
     Ok(Arc::new(l))
 }
 
+/// The per-user socket, or `$IPSEC_CLIENT_SOCKET` (tests run on private
+/// sockets; GUI clients on Linux try that variable first).
+#[cfg(unix)]
+fn mock_endpoint() -> std::path::PathBuf {
+    std::env::var_os(ipc_proto::client::SOCKET_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(ipc_proto::client::endpoint)
+}
+
+#[cfg(windows)]
+fn mock_endpoint() -> std::path::PathBuf {
+    ipc_proto::client::endpoint()
+}
+
 #[cfg(unix)]
 fn mock_listener() -> io::Result<Arc<dyn Listener>> {
     Ok(Arc::new(crate::unix::UnixSocketListener::bind(
-        ipc_proto::client::endpoint(),
+        mock_endpoint(),
         0o600,
     )?))
 }
