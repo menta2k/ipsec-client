@@ -5,11 +5,12 @@ use crate::host::{self, Mode};
 use crate::paths::{DESCRIPTION, DISPLAY_NAME, SERVICE_NAME};
 use std::ffi::{OsStr, OsString};
 use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
     ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType, SessionChangeReason,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -45,11 +46,34 @@ fn status(
     }
 }
 
+/// Only a real sign-out ends the tunnel; lock/unlock, fast user switching
+/// and remote (dis)connects do not (003 FR-014).
+pub fn is_signout(reason: SessionChangeReason) -> bool {
+    reason == SessionChangeReason::SessionLogoff
+}
+
+type SignoutHook = Box<dyn Fn() -> bool + Send + Sync>;
+
 fn run_service() -> Result<(), Box<dyn std::error::Error>> {
     let (stop_tx, stop_rx) = channel();
+    // Filled once the host is running; the handler is registered before.
+    let signout: Arc<Mutex<Option<SignoutHook>>> = Arc::new(Mutex::new(None));
+    let signout_slot = signout.clone();
     let handler = move |ev| match ev {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             let _ = stop_tx.send(());
+            ServiceControlHandlerResult::NoError
+        }
+        ServiceControl::SessionChange(p) => {
+            if is_signout(p.reason) {
+                // Synchronous: the network is restored before Winlogon shows
+                // the sign-in screen again (003 research R5).
+                if let Some(hook) = signout_slot.lock().unwrap().as_ref() {
+                    if hook() {
+                        super::eventlog::info("IpsecClient disconnected the VPN at sign-out");
+                    }
+                }
+            }
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -76,9 +100,12 @@ fn run_service() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     };
+    *signout.lock().unwrap() = Some(Box::new(host.signout_hook()));
     sh.set_service_status(status(
         ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::SESSION_CHANGE,
         Duration::ZERO,
         0,
     ))?;
@@ -206,5 +233,30 @@ pub fn exit_code(e: &windows_service::Error) -> i32 {
         5
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_logoff_counts_as_signout() {
+        use SessionChangeReason::*;
+        assert!(is_signout(SessionLogoff));
+        for r in [
+            ConsoleConnect,
+            ConsoleDisconnect,
+            RemoteConnect,
+            RemoteDisconnect,
+            SessionLogon,
+            SessionLock,
+            SessionUnlock,
+            SessionRemoteControl,
+            SessionCreate,
+            SessionTerminate,
+        ] {
+            assert!(!is_signout(r), "{r:?}");
+        }
     }
 }

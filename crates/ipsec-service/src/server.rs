@@ -42,6 +42,9 @@ pub trait Engine: Send + Sync {
         id: &str,
         password: Option<SecretString>,
     ) -> Result<(), RejectError>;
+    /// The signed-in user signed out (003): disconnect unless the policy
+    /// keeps tunnels; returns once the network is restored.
+    fn on_signout(&self, policy: Policy) -> bool;
     fn shutdown(&self);
 }
 
@@ -72,6 +75,9 @@ impl Engine for vpn_core::ConnectionManager {
         password: Option<SecretString>,
     ) -> Result<(), RejectError> {
         vpn_core::ConnectionManager::connect_at_sign_in(self, id, password)
+    }
+    fn on_signout(&self, policy: Policy) -> bool {
+        vpn_core::ConnectionManager::on_signout(self, policy)
     }
     fn shutdown(&self) {
         vpn_core::ConnectionManager::shutdown(self)
@@ -395,6 +401,9 @@ mod tests {
                 .unwrap()
                 .push((id.to_string(), password.map(|p| p.expose().to_string())));
             Ok(())
+        }
+        fn on_signout(&self, _policy: Policy) -> bool {
+            false
         }
         fn shutdown(&self) {}
     }

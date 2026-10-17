@@ -28,6 +28,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
+/// How long sign-out waits for the tunnel teardown (DELETE + network revert).
+const SIGNOUT_TEARDOWN_LIMIT: Duration = Duration::from_secs(10);
+
 const TARGET: &str = "manager";
 
 /// Engine tunables.
@@ -317,6 +320,33 @@ impl ConnectionManager {
     }
 
     /// Tear down any tunnel, clean up, and stop the worker (service stop).
+    /// The signed-in Windows user signed out (003 FR-012/FR-013). Unless the
+    /// policy keeps tunnels, disconnect whatever is active (from the app or the
+    /// sign-in screen) and wait, bounded, until the network is restored, so
+    /// the next person at the sign-in screen does not inherit the session.
+    /// Returns true if a tunnel was disconnected.
+    pub fn on_signout(&self, policy: ipc_proto::Policy) -> bool {
+        if !self.state().is_active() {
+            return false;
+        }
+        if policy.keep_tunnel_on_signout {
+            info!(target: TARGET, "user signed out; keeping the tunnel (policy)");
+            return false;
+        }
+        info!(target: TARGET, reason = "signout", "user signed out; disconnecting");
+        if self.disconnect().is_err() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + SIGNOUT_TEARDOWN_LIMIT;
+        while self.state().is_active() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.state().is_active() {
+            warn!(target: TARGET, "tunnel still tearing down after sign-out limit");
+        }
+        true
+    }
+
     pub fn shutdown(&self) {
         self.shared.cancel.store(true, Ordering::SeqCst);
         let (ack_tx, ack_rx) = channel();

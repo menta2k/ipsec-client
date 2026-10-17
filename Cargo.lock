@@ -1800,6 +1800,7 @@ dependencies = [
  "gtk",
  "ipc-proto",
  "notify-rust",
+ "serde_json",
  "tray-icon",
 ]
 
@@ -1821,6 +1822,7 @@ dependencies = [
  "ctrlc",
  "ipc-proto",
  "libc",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-appender",

@@ -67,6 +67,21 @@ impl Engine for SimulatedEngine {
         }
     }
 
+    fn on_signout(&self, policy: Policy) -> bool {
+        if !self.state().is_active() || policy.keep_tunnel_on_signout {
+            return false;
+        }
+        info!(target: "simulate", reason = "signout", "user signed out; disconnecting");
+        if self.disconnect().is_err() {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.state().is_active() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
     fn connect_at_sign_in(
         &self,
         id: &str,

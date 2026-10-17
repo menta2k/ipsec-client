@@ -6,6 +6,7 @@ mod host;
 mod linux;
 mod logging;
 mod paths;
+mod plc_cli;
 mod server;
 mod simulate;
 #[cfg(unix)]
@@ -25,7 +26,10 @@ commands:
   run            run in the foreground (Ctrl-C stops cleanly)
   run --mock     run a simulated engine (no privileges, any OS) for GUI development
   cleanup        undo network changes left by an unclean exit
-  service        entry point used by the Service Control Manager";
+  service        entry point used by the Service Control Manager
+  plc …          Pre-Login Connect: sign-in profiles and sign-out policy
+  profile import <file.json> [--sign-in]
+                 create or update profiles (administrator)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +47,9 @@ fn main() {
         ["stop"] => manage("stop", Manage::Stop),
         ["cleanup"] => cleanup(),
         ["service"] => service_entry(),
+        ["plc", ..] | ["profile", ..] => {
+            plc_cli::main(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        }
         ["-h"] | ["--help"] | ["help"] => {
             println!("{USAGE}");
             0

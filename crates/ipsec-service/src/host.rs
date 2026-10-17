@@ -22,6 +22,7 @@ pub enum Mode {
 
 pub struct Host {
     engine: Arc<dyn Engine>,
+    settings: Arc<vpn_core::SettingsStore>,
     listener: Arc<dyn Listener>,
     stop: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
@@ -60,10 +61,11 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
     if let Some(e) = problem {
         tracing::warn!(target: "host", error = %e, "settings unreadable; using defaults");
     }
+    let settings = Arc::new(settings);
     let ctx = Arc::new(ServerCtx {
         engine: engine.clone(),
         store,
-        settings: Arc::new(settings),
+        settings: settings.clone(),
         bus,
         logs: ring,
         service_name: format!("ipsec-service {}", env!("CARGO_PKG_VERSION")),
@@ -78,6 +80,7 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
     info!(target: "host", mode = ?mode, "service ready");
     Ok(Host {
         engine,
+        settings,
         listener,
         stop,
         accept: Some(accept),
@@ -259,6 +262,15 @@ fn real_parts(
 }
 
 impl Host {
+    /// A callable for the SCM handler: the signed-in user signed out (003
+    /// FR-012). Applies the current policy; returns once the network is
+    /// restored (or immediately if there is nothing to do).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn signout_hook(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let (engine, settings) = (self.engine.clone(), self.settings.clone());
+        move || engine.on_signout(settings.get())
+    }
+
     /// Tear down any tunnel (with full network cleanup), then stop serving.
     pub fn stop(mut self) {
         info!(target: "host", "stopping");

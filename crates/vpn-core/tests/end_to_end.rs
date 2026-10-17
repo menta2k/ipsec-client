@@ -558,6 +558,35 @@ fn sign_in_connect_psk_takes_no_password() {
 }
 
 #[test]
+fn signout_disconnects_by_default_and_waits_for_cleanup() {
+    let h = harness(ResponderConfig::default(), |_| {});
+    // Idle: nothing to do.
+    assert!(!h.mgr.on_signout(ipc_proto::Policy::default()));
+    h.connect(Some(PASSWORD));
+    h.wait_connected();
+    assert!(h.mgr.on_signout(ipc_proto::Policy::default()));
+    // Synchronous: the network is already restored when it returns (FR-012).
+    assert!(!h.mgr.state().is_active());
+    h.assert_clean();
+    wait_until("gateway saw DELETE", || h.resp.obs().got_delete);
+}
+
+#[test]
+fn signout_keeps_the_tunnel_when_the_policy_says_so() {
+    let h = harness(ResponderConfig::default(), |_| {});
+    h.connect(Some(PASSWORD));
+    h.wait_connected();
+    let keep = ipc_proto::Policy {
+        keep_tunnel_on_signout: true,
+    };
+    assert!(!h.mgr.on_signout(keep));
+    assert!(matches!(h.mgr.state(), ConnectionState::Connected { .. }));
+    h.mgr.disconnect().unwrap();
+    h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
+    h.assert_clean();
+}
+
+#[test]
 fn shutdown_while_connected_cleans_up() {
     let h = harness(ResponderConfig::default(), |_| {});
     h.connect(Some(PASSWORD));

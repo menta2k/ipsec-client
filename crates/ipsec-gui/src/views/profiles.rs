@@ -73,7 +73,23 @@ pub struct Editor {
     pub psk: SecretField,
     pub password: SecretField,
     pub error: Option<String>,
+    /// Offered at the Windows sign-in screen (003); shown, never edited here.
+    pub sign_in: bool,
 }
+
+/// Text of a profile in the list: sign-in profiles are marked (003 FR-018).
+pub fn list_label(p: &ProfileView) -> String {
+    if p.sign_in {
+        format!("{}  (sign-in)", p.name)
+    } else {
+        p.name.clone()
+    }
+}
+
+/// Read-only note in the editor for sign-in profiles.
+pub const SIGN_IN_NOTE: &str = "Available at sign-in (set by an administrator)";
+pub const SIGN_IN_HINT: &str =
+    "Administrators change this with `ipsec-service plc enable|disable <name>`.";
 
 impl Editor {
     pub fn new_profile() -> Self {
@@ -83,6 +99,7 @@ impl Editor {
             psk: SecretField::new(false),
             password: SecretField::new(false),
             error: None,
+            sign_in: false,
         }
     }
 
@@ -93,6 +110,7 @@ impl Editor {
             psk: SecretField::new(v.has_psk),
             password: SecretField::new(v.has_password),
             error: None,
+            sign_in: v.sign_in,
         }
     }
 
@@ -129,7 +147,7 @@ impl App {
                     for p in self.profiles.clone() {
                         let selected = self.editor.as_ref().and_then(|e| e.id.as_deref())
                             == Some(p.id.as_str());
-                        if ui.selectable_label(selected, &p.name).clicked() {
+                        if ui.selectable_label(selected, list_label(&p)).clicked() {
                             self.editor = Some(Editor::for_profile(&p));
                         }
                     }
@@ -255,6 +273,11 @@ impl App {
                     }
                 });
 
+            if ed.sign_in {
+                ui.add_space(4.0);
+                ui.label(RichText::new(SIGN_IN_NOTE).weak())
+                    .on_hover_text(SIGN_IN_HINT);
+            }
             if let Some(e) = &ed.error {
                 ui.colored_label(egui::Color32::from_rgb(0xd6, 0x3a, 0x3a), e);
             }
@@ -311,5 +334,27 @@ impl App {
                 self.editor = None;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_profiles_are_marked_and_kept_read_only() {
+        let mut v = ProfileView {
+            name: "Office".into(),
+            ..Default::default()
+        };
+        assert_eq!(list_label(&v), "Office");
+        assert!(!Editor::for_profile(&v).sign_in);
+        v.sign_in = true;
+        assert_eq!(list_label(&v), "Office  (sign-in)");
+        let ed = Editor::for_profile(&v);
+        assert!(ed.sign_in);
+        // The edit sent on save has no way to carry the flag.
+        let wire = serde_json::to_string(&ed.edit).unwrap();
+        assert!(!wire.contains("sign_in"), "{wire}");
     }
 }
