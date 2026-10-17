@@ -249,6 +249,7 @@ fn real_parts(
     });
 
     let socket = paths::socket_path();
+    let mut created_dir = None;
     if let Some(parent) = socket.parent() {
         // systemd's RuntimeDirectory= (0750, group ipsec-client) normally
         // exists already.
@@ -257,6 +258,7 @@ fn real_parts(
                 .recursive(true)
                 .mode(0o750)
                 .create(parent)?;
+            created_dir = Some(parent.to_path_buf());
         }
     }
     // 0660: members of the service's group may connect (research R5).
@@ -264,6 +266,16 @@ fn real_parts(
         socket.clone(),
         0o660,
     )?);
+    // Started by hand as root, the socket would belong to group root; give it
+    // (and a directory we created) to the VPN group so its members can connect.
+    let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    if let Some(gid) = crate::linux::group::group_gid(&groups, crate::linux::group::VPN_GROUP) {
+        for path in created_dir.iter().chain(std::iter::once(&socket)) {
+            if let Err(e) = std::os::unix::fs::chown(path, None, Some(gid)) {
+                tracing::warn!(target: "host", path = %path.display(), error = %e, "cannot hand the socket to the ipsec-client group");
+            }
+        }
+    }
     info!(target: "host", endpoint = %socket.display(), "listening");
     Ok((mgr, store, listener, guard))
 }

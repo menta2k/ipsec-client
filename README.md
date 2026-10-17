@@ -2,8 +2,11 @@
 
 A pure-Rust IKEv2/IPsec remote-access VPN client, built in two parts:
 
-- **`ipsec-service`**: a privileged Windows service (LocalSystem). It owns the IKE and ESP
-  state, the Wintun adapter, routes and DNS.
+- **`ipsec-service`**: the service that owns the IKE and ESP state, the tunnel adapter, routes
+  and DNS:
+  - on Windows, a Windows service running as LocalSystem, with a Wintun adapter
+  - on Linux, a systemd service running as the unprivileged `ipsec-client` account with only
+    `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`, with a TUN device (in development, feature 002)
 - **`ipsec-gui`**: an unprivileged, cross-platform window with a system tray (Windows,
   Linux and macOS). It controls the service over a versioned local IPC protocol.
 
@@ -13,11 +16,17 @@ workspace with no dependency on the prototype crates:
 - **IKEv2 handshake**: IKE_SA_INIT and IKE_AUTH, with PSK or with PSK + EAP-MSCHAPv2.
 - **NAT traversal**: NAT-T to gateway port 4500 from an ephemeral local port.
 - **Mode-config**: the internal address and DNS servers.
-- **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun.
+- **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun or a Linux TUN device.
 - **Liveness and teardown**: keepalives, DPD, and an IKE DELETE on disconnect.
 
-Specs live in [`specs/001-ipsec-vpn-client/`](specs/001-ipsec-vpn-client/) (Spec Kit), and the
-project's principles in [`.specify/memory/constitution.md`](.specify/memory/constitution.md).
+The specs (Spec Kit) are:
+
+- [`specs/001-ipsec-vpn-client/`](specs/001-ipsec-vpn-client/): the Windows client
+- [`specs/002-linux-support/`](specs/002-linux-support/): the Linux service and desktop
+- [`specs/003-pre-login-connect/`](specs/003-pre-login-connect/): connecting from the Windows
+  sign-in screen
+
+The project's principles are in [`.specify/memory/constitution.md`](.specify/memory/constitution.md).
 
 ## Architecture
 
@@ -37,8 +46,12 @@ project's principles in [`.specify/memory/constitution.md`](.specify/memory/cons
 | `crates/ike` | IKEv2/ESP/EAP codecs, key schedule, DH, SK payload, anti-replay | forbidden |
 | `crates/ipc-proto` | GUI↔service messages, framing, blocking client | forbidden |
 | `crates/vpn-core` | Session driver, data path, state machine, profile store, mocks | forbidden |
-| `crates/ipsec-service` | SCM host, IPC server, Wintun / IP Helper / DPAPI / pipe back-ends | Windows modules only |
+| `crates/ipsec-service` | IPC server and host. Windows: SCM, Wintun, IP Helper, DPAPI, pipe. Linux: systemd, TUN, iproute2/resolvectl, Unix socket. | `src/windows/` and `src/linux/sys.rs` only |
 | `crates/ipsec-gui` | eframe window + tray-icon + notifications | none |
+| `crates/ipsec-plap` | Pre-Login Connect: the sign-in screen provider DLL (logic and bounded IPC done; COM layer pending) | COM layer only (not yet written) |
+
+On Linux the service listens on `/run/ipsec-client/ipsec-client.sock`. The socket's permissions
+admit only root and the `ipsec-client` group.
 
 ## Build & test
 
@@ -63,18 +76,24 @@ in-process mock IKEv2 gateway (`vpn-core/tests/end_to_end.rs`), covering:
 They also include an IPC integration test against the real binary
 (`ipsec-service/tests/mock_service.rs`).
 
-Linux GUI build dependencies: `libgtk-3-dev`, `libxdo-dev` and
+On Linux, the GUI needs `pkg-config`, `libgtk-3-dev`, `libxdo-dev` and
 `libayatana-appindicator3-dev`.
 
-The Linux port (feature 002) is in progress. On a Windows machine, type-check and lint the
-Linux service code with:
+On a Windows machine you can still lint the Linux code. The GUI is left out because its GTK
+dependencies need Linux:
 
 ```sh
 rustup target add x86_64-unknown-linux-gnu
-cargo clippy --target x86_64-unknown-linux-gnu --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -- -D warnings
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -p ipsec-plap -- -D warnings
 ```
 
-The GUI isn't included because `gtk-sys` needs the Linux GTK development files.
+CI (`.github/workflows/ci.yml`) runs these jobs:
+
+- **Windows and Ubuntu 24.04 gates:** fmt, clippy and tests.
+- **The Linux root-only TUN test.**
+- **The `.deb`/`.rpm` build.**
+- **An end-to-end test against a real strongSwan gateway** in network namespaces
+  (`sudo tests/linux-e2e/run.sh`).
 
 ## Run
 
@@ -137,6 +156,54 @@ version in place once the workspace version in `Cargo.toml` is raised.
 If the service was registered earlier with `ipsec-service install`, run
 `ipsec-service uninstall` first. Otherwise the MSI can't create a service with the same name.
 
+### Real tunnels (Linux, in development)
+
+Install the package (see below), or run the service by hand as root:
+
+```sh
+sudo target/release/ipsec-service run       # foreground; Ctrl-C or SIGTERM stops cleanly
+target/release/ipsec-gui                    # as a normal user in the ipsec-client group
+```
+
+With the package, the `ipsec-client.service` systemd unit runs it:
+
+- `sudo ipsec-service install | uninstall | start | stop` wrap `systemctl`.
+- `sudo ipsec-service cleanup` replays the network-change journal.
+
+Users must be in the `ipsec-client` group, then log in again. Others see "not allowed to control
+the VPN".
+
+| Path | Contents |
+|------|----------|
+| `/var/lib/ipsec-client/profiles.json` | Profiles, with secrets encrypted under the machine key |
+| `/var/lib/ipsec-client/secret.key` | The machine key (0600, service account only) |
+| `/var/lib/ipsec-client/netstate.json` | The network-change journal |
+| `/var/lib/ipsec-client/logs/` | Daily rotating logs (also in `journalctl -u ipsec-client`) |
+
+DNS uses systemd-resolved: the VPN servers are set on the tunnel interface with the `~.`
+routing domain. Without resolved, the service backs up and rewrites `/etc/resolv.conf`. This
+needs root, so the packages depend on systemd-resolved.
+
+### Linux packages
+
+```sh
+cargo install cargo-deb cargo-generate-rpm
+packaging/linux/build.sh            # or --deb-only / --rpm-only
+sudo apt install ./target/debian/ipsec-client_*.deb    # Ubuntu 22.04+, Debian 12+
+sudo dnf install ./target/generate-rpm/*.rpm           # Fedora 39+
+```
+
+The `ipsec-client` package installs:
+
+- both programs, the systemd unit, the account (sysusers.d), and a polkit rule for the DNS
+  changes
+- the desktop entry, a tray autostart entry, and the icons
+
+Installing creates the account and group, adds the installing user to the group, and enables
+and starts the service. Removing it stops the service, which tears down any tunnel, and keeps
+`/var/lib/ipsec-client`. A Debian `purge` deletes it. The package maintainer field is a
+placeholder to set before publishing.
+
 ### Pre-Login Connect (Windows, in development)
 
 Pre-Login Connect lets users connect the VPN from the Windows sign-in screen, through
@@ -151,12 +218,27 @@ recovery procedure, is [docs/pre-login-connect.md](docs/pre-login-connect.md).
 
 ## Status
 
-The protocol core, IPC, engine and GUI build and pass their tests. The Windows platform layer
-(Wintun, IP Helper routes and DNS, DPAPI, the SCM, the named pipe) compiles, and the pipe and
-DPAPI are exercised by tests. **A live tunnel against a real gateway has not been validated
-yet.** Follow the "Real tunnel" steps in
-[`quickstart.md`](specs/001-ipsec-vpn-client/quickstart.md) to do that. The Linux and macOS
-tray code paths compile only on those platforms, so they are unverified from a Windows build.
+- **Windows (001):**
+  - The protocol core, IPC, engine and GUI build and pass their tests. The pipe and DPAPI are
+    exercised by tests.
+  - A live tunnel has been run against a FortiGate: it connected and carried traffic in both
+    directions, and the status showed the full-tunnel routes and the VPN DNS servers. The
+    routing table and DNS were not checked independently.
+  - The MSI installer builds and passes validation.
+  - The formal real-tunnel checklist in [`quickstart.md`](specs/001-ipsec-vpn-client/quickstart.md)
+    is still open.
+- **Linux (002):**
+  - The service code is written and lints cleanly for Linux: TUN, network and DNS
+    configuration, machine-key secrets, systemd, the socket and the packages. The logic is
+    unit-tested on every OS.
+  - **Nothing has run on Linux yet.** The GUI's GTK tray code has never been compiled. CI and
+    the strongSwan end-to-end test will be the first runs, followed by
+    [`specs/002-linux-support/quickstart.md`](specs/002-linux-support/quickstart.md) on a VM.
+- **Pre-Login Connect (003):**
+  - The service side is done, with tests: sign-in profiles, administrator checks, sign-out
+    policy, the `plc` and `profile import` commands, and the sign-in logic and bounded IPC.
+  - The sign-in screen DLL's COM layer and its installer feature wait on a VM spike (T001).
+- **macOS:** the GUI targets it, but it has never been built there.
 
 Not in v1:
 
@@ -166,4 +248,4 @@ Not in v1:
 - IKE over TCP
 - COOKIE retry
 - split DNS
-- service back-ends for Linux and macOS
+- a macOS service back-end
