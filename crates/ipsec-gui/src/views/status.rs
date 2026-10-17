@@ -160,6 +160,13 @@ impl App {
                         format!("{} in / {} out", s.stats.dropped_in, s.stats.dropped_out),
                     );
                 }
+                if s.stats.filtered_out > 0 {
+                    row(
+                        ui,
+                        "Not tunneled",
+                        format!("{} (IPv6, multicast, broadcast)", s.stats.filtered_out),
+                    );
+                }
                 row(ui, "IKE", s.ike_suite.clone());
                 row(ui, "ESP", s.esp_suite.clone());
             });

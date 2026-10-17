@@ -220,7 +220,9 @@ fn eap_connect_ping_and_disconnect() {
     wait_until("stats", || {
         h.mgr
             .session()
-            .map(|s| s.stats.packets_in >= 1 && s.stats.dropped_out >= 1)
+            .map(|s| {
+                s.stats.packets_in >= 1 && s.stats.filtered_out >= 1 && s.stats.dropped_out == 0
+            })
             .unwrap_or(false)
     });
 

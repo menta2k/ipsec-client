@@ -231,8 +231,13 @@ pub struct Stats {
     pub bytes_out: u64,
     pub packets_in: u64,
     pub packets_out: u64,
+    /// Packets lost to errors: failed decryption/replay check, or a failed send.
     pub dropped_in: u64,
     pub dropped_out: u64,
+    /// Outbound packets deliberately not tunneled (IPv6, multicast, broadcast).
+    /// Defaulted so peers that predate the field still interoperate.
+    #[serde(default)]
+    pub filtered_out: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +358,15 @@ pub struct LogLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_without_filtered_out_still_parse() {
+        let s: Stats = serde_json::from_str(
+            r#"{"bytes_in":1,"bytes_out":2,"packets_in":3,"packets_out":4,"dropped_in":5,"dropped_out":6}"#,
+        )
+        .unwrap();
+        assert_eq!((s.dropped_out, s.filtered_out), (6, 0));
+    }
 
     fn rt(f: &Frame) {
         let s = serde_json::to_string(f).unwrap();

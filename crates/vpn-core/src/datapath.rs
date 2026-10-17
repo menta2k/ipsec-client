@@ -72,6 +72,7 @@ pub struct Counters {
     pub packets_out: AtomicU64,
     pub dropped_in: AtomicU64,
     pub dropped_out: AtomicU64,
+    pub filtered_out: AtomicU64,
 }
 
 impl Counters {
@@ -83,6 +84,7 @@ impl Counters {
             packets_out: self.packets_out.load(Ordering::Relaxed),
             dropped_in: self.dropped_in.load(Ordering::Relaxed),
             dropped_out: self.dropped_out.load(Ordering::Relaxed),
+            filtered_out: self.filtered_out.load(Ordering::Relaxed),
         }
     }
 }
@@ -244,7 +246,7 @@ fn spawn_outbound(
                 || (224..=239).contains(&pkt[16])
                 || pkt[16..20] == [255; 4]
             {
-                c.dropped_out.fetch_add(1, Ordering::Relaxed);
+                c.filtered_out.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             match esp.encrypt(4, &pkt) {
