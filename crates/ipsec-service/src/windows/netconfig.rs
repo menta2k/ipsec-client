@@ -222,6 +222,10 @@ impl NetConfig for IpHelperNetConfig {
                 }
             }
             NetChange::Dns { if_id, servers } => set_dns(*if_id, servers),
+            NetChange::ResolvConf { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resolv.conf changes are Linux-only",
+            )),
         }
     }
 
@@ -254,6 +258,8 @@ impl NetConfig for IpHelperNetConfig {
                     r => r,
                 };
             }
+            // Never produced on Windows; nothing to undo.
+            NetChange::ResolvConf { .. } => return Ok(()),
         };
         // Already gone (e.g. adapter removed) counts as reverted.
         if rc == ERROR_NOT_FOUND || rc == windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND {

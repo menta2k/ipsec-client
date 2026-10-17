@@ -14,7 +14,14 @@ use std::path::PathBuf;
 /// Windows named-pipe path of the service endpoint.
 pub const PIPE_NAME: &str = r"\\.\pipe\IpsecClient.v1";
 
-/// Platform endpoint the service listens on.
+/// Socket of the Linux system service (002 contracts/linux-system-integration.md).
+pub const SYSTEM_SOCKET: &str = "/run/ipsec-client/ipsec-client.sock";
+
+/// Environment variable that overrides the system socket (tests, developers).
+pub const SOCKET_ENV: &str = "IPSEC_CLIENT_SOCKET";
+
+/// The per-user endpoint: the named pipe on Windows; on Unix the socket the
+/// mock service (`run --mock`) listens on.
 pub fn endpoint() -> PathBuf {
     #[cfg(windows)]
     {
@@ -22,13 +29,67 @@ pub fn endpoint() -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            return PathBuf::from(dir).join("ipsec-client.sock");
+        user_socket(&|k| std::env::var_os(k), &std::env::temp_dir())
+    }
+}
+
+/// Every endpoint a client should try, in order (002 research R6).
+pub fn endpoints() -> Vec<PathBuf> {
+    endpoint_candidates(
+        Os::current(),
+        |k| std::env::var_os(k),
+        &std::env::temp_dir(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Os {
+    Windows,
+    Linux,
+    OtherUnix,
+}
+
+impl Os {
+    fn current() -> Os {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "linux") {
+            Os::Linux
+        } else {
+            Os::OtherUnix
         }
-        let uid = std::env::var("UID")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_default();
-        std::env::temp_dir().join(format!("ipsec-client-{uid}.sock"))
+    }
+}
+
+type Env<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
+fn user_socket(env: Env<'_>, tmp: &std::path::Path) -> PathBuf {
+    if let Some(dir) = env("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("ipsec-client.sock");
+    }
+    let user = env("UID")
+        .or_else(|| env("USER"))
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tmp.join(format!("ipsec-client-{user}.sock"))
+}
+
+/// Linux: override, system socket, then the per-user (mock) socket.
+/// Windows keeps its single pipe; other Unixes have no system service.
+fn endpoint_candidates(
+    os: Os,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    tmp: &std::path::Path,
+) -> Vec<PathBuf> {
+    match os {
+        Os::Windows => vec![PathBuf::from(PIPE_NAME)],
+        Os::Linux => {
+            let mut v: Vec<PathBuf> = env(SOCKET_ENV).map(PathBuf::from).into_iter().collect();
+            v.push(PathBuf::from(SYSTEM_SOCKET));
+            v.push(user_socket(&env, tmp));
+            v
+        }
+        Os::OtherUnix => vec![user_socket(&env, tmp)],
     }
 }
 
@@ -36,9 +97,48 @@ pub fn endpoint() -> PathBuf {
 pub trait Stream: Read + Write + Send {}
 impl<T: Read + Write + Send> Stream for T {}
 
-/// Open a raw stream to the service endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt {
+    /// Nothing is listening there; try the next candidate.
+    TryNext,
+    /// The endpoint exists but access control refused us. Never fall through:
+    /// that would silently land an unauthorized user on another service.
+    Unauthorized,
+    Fail,
+}
+
+fn classify(kind: io::ErrorKind) -> Attempt {
+    match kind {
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Attempt::TryNext,
+        io::ErrorKind::PermissionDenied => Attempt::Unauthorized,
+        _ => Attempt::Fail,
+    }
+}
+
+/// Connect to the first reachable endpoint of `paths`.
+fn connect_first(paths: &[PathBuf]) -> io::Result<Box<dyn Stream>> {
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no service endpoint");
+    for p in paths {
+        match connect_stream_at(p) {
+            Ok(s) => return Ok(s),
+            Err(e) if classify(e.kind()) == Attempt::TryNext => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Open a raw stream to the service.
 pub fn connect_stream() -> io::Result<Box<dyn Stream>> {
-    connect_stream_at(&endpoint())
+    connect_first(&endpoints())
+}
+
+/// How a failure to reach the service is reported.
+fn connect_error(e: io::Error) -> ClientError {
+    match classify(e.kind()) {
+        Attempt::Unauthorized => ClientError::Unauthorized,
+        _ => ClientError::Unavailable(e),
+    }
 }
 
 /// Open a raw stream to an explicit endpoint path.
@@ -73,6 +173,9 @@ pub fn connect_stream_at(path: &std::path::Path) -> io::Result<Box<dyn Stream>> 
 pub enum ClientError {
     /// The service is not running / endpoint unavailable.
     Unavailable(io::Error),
+    /// The service is running but this user may not control it (Linux:
+    /// not in the `ipsec-client` group).
+    Unauthorized,
     /// Client and service protocol versions differ.
     VersionMismatch {
         service: u32,
@@ -92,6 +195,7 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::Unavailable(e) => write!(f, "service not running ({e})"),
+            ClientError::Unauthorized => f.write_str("not authorized to control the VPN service"),
             ClientError::VersionMismatch { service, client } => write!(
                 f,
                 "client and service versions are incompatible (service protocol {service}, client {client})"
@@ -209,7 +313,7 @@ pub struct CommandClient {
 impl CommandClient {
     /// Connect to the default endpoint and perform the handshake.
     pub fn connect(client_name: &str) -> Result<Self, ClientError> {
-        let stream = connect_stream().map_err(ClientError::Unavailable)?;
+        let stream = connect_stream().map_err(connect_error)?;
         Self::over(stream, client_name)
     }
 
@@ -254,7 +358,7 @@ pub struct EventStream {
 impl EventStream {
     /// Connect to the default endpoint and subscribe.
     pub fn subscribe(client_name: &str) -> Result<(Snapshot, Self), ClientError> {
-        let stream = connect_stream().map_err(ClientError::Unavailable)?;
+        let stream = connect_stream().map_err(connect_error)?;
         Self::over(stream, client_name)
     }
 
@@ -305,6 +409,103 @@ impl EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| std::ffi::OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn linux_candidates_prefer_override_then_system_then_user_socket() {
+        let tmp = PathBuf::from("/tmp");
+        let all = endpoint_candidates(
+            Os::Linux,
+            env(&[
+                ("IPSEC_CLIENT_SOCKET", "/x/test.sock"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ]),
+            &tmp,
+        );
+        assert_eq!(
+            all,
+            [
+                PathBuf::from("/x/test.sock"),
+                PathBuf::from(SYSTEM_SOCKET),
+                PathBuf::from("/run/user/1000/ipsec-client.sock"),
+            ]
+        );
+        let plain = endpoint_candidates(Os::Linux, env(&[("USER", "bob")]), &tmp);
+        assert_eq!(
+            plain,
+            [
+                PathBuf::from(SYSTEM_SOCKET),
+                PathBuf::from("/tmp/ipsec-client-bob.sock"),
+            ]
+        );
+    }
+
+    #[test]
+    fn other_unix_has_no_system_socket_and_windows_only_the_pipe() {
+        let tmp = PathBuf::from("/tmp");
+        let mac = endpoint_candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
+        assert_eq!(mac, [PathBuf::from("/r/ipsec-client.sock")]);
+        let win = endpoint_candidates(
+            Os::Windows,
+            env(&[("IPSEC_CLIENT_SOCKET", "/ignored")]),
+            &tmp,
+        );
+        assert_eq!(win, [PathBuf::from(PIPE_NAME)]);
+    }
+
+    #[test]
+    fn permission_denied_stops_the_search_others_fall_through() {
+        use io::ErrorKind::*;
+        assert_eq!(classify(NotFound), Attempt::TryNext);
+        assert_eq!(classify(ConnectionRefused), Attempt::TryNext);
+        assert_eq!(classify(PermissionDenied), Attempt::Unauthorized);
+        assert_eq!(classify(TimedOut), Attempt::Fail);
+    }
+
+    #[test]
+    fn refused_by_access_control_is_reported_as_unauthorized() {
+        let e = connect_error(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(matches!(e, ClientError::Unauthorized), "{e:?}");
+        assert!(e.to_string().contains("not authorized"));
+        let e = connect_error(io::Error::from(io::ErrorKind::NotFound));
+        assert!(matches!(e, ClientError::Unavailable(_)), "{e:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_socket_yields_unauthorized_not_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses file permissions, so the check is meaningless there.
+        if std::fs::metadata("/proc/self")
+            .map(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.uid() == 0
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ipc-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s.sock");
+        let _ = std::fs::remove_file(&sock);
+        let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let fallback = dir.join("missing.sock");
+        let r = connect_first(&[sock.clone(), fallback]);
+        assert_eq!(
+            r.err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::net::{TcpListener, TcpStream};
 
     /// Loopback TCP stands in for the pipe/socket in tests (same byte stream).

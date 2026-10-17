@@ -172,17 +172,25 @@ impl ProfileStore {
     }
 
     /// Decrypt the stored secrets of a profile. The PSK is mandatory; the
-    /// password is returned if saved.
+    /// password is returned if saved. A secret that can no longer be
+    /// decrypted (lost or replaced machine key, corrupt blob) counts as not
+    /// saved, so the user is asked for it again instead of the connect failing
+    /// (002 FR-014).
     pub fn load_secrets(&self, id: &str) -> Result<ProfileSecrets, StoreError> {
         let p = self.get(id).ok_or(StoreError::NotFound)?;
-        let psk_blob = p
+        let psk = p
             .psk_blob
             .as_deref()
+            .and_then(|b| self.unprotect_or_warn(&p.name, "pre-shared key", b))
             .ok_or(StoreError::MissingSecret("pre-shared key"))?;
-        let psk = self.unprotect_hex(psk_blob)?;
         let password = match p.password_blob.as_deref() {
             Some(b) => {
-                let raw = self.unprotect_hex(b)?;
+                let Some(raw) = self.unprotect_or_warn(&p.name, "password", b) else {
+                    return Ok(ProfileSecrets {
+                        psk,
+                        password: None,
+                    });
+                };
                 let s = std::str::from_utf8(&raw).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "password is not UTF-8")
                 })?;
@@ -191,6 +199,25 @@ impl ProfileStore {
             None => None,
         };
         Ok(ProfileSecrets { psk, password })
+    }
+
+    fn unprotect_or_warn(
+        &self,
+        profile: &str,
+        what: &str,
+        blob: &str,
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        match self.unprotect_hex(blob) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    profile,
+                    error = %e,
+                    "saved {what} cannot be decrypted; treating it as not saved"
+                );
+                None
+            }
+        }
     }
 
     fn unprotect_hex(&self, blob: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
@@ -300,6 +327,57 @@ mod tests {
         std::env::temp_dir()
             .join(format!("ipsec-store-{tag}-{}", to_hex(&b)))
             .join("profiles.json")
+    }
+
+    /// Opens blobs like the mock protector, but refuses those whose plaintext
+    /// starts with `refuse` (simulating a lost or replaced machine key).
+    struct PickyProtector {
+        refuse: &'static str,
+    }
+
+    impl SecretProtector for PickyProtector {
+        fn protect(&self, plain: &[u8]) -> io::Result<Vec<u8>> {
+            InsecureMockProtector.protect(plain)
+        }
+        fn unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+            let plain = InsecureMockProtector.unprotect(blob)?;
+            if plain.starts_with(self.refuse.as_bytes()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad key"));
+            }
+            Ok(plain)
+        }
+    }
+
+    #[test]
+    fn unreadable_secrets_count_as_not_saved() {
+        // FR-014 (002): profiles still load; an undecryptable password is
+        // simply absent, and an undecryptable PSK is reported as missing.
+        let path = temp_path("unreadable");
+        let store =
+            ProfileStore::open(Some(path.clone()), Arc::new(InsecureMockProtector)).unwrap();
+        let id = store.create(&edit("Office")).unwrap().id;
+
+        let pw_lost = ProfileStore::open(
+            Some(path.clone()),
+            Arc::new(PickyProtector { refuse: "Hunter2" }),
+        )
+        .unwrap();
+        assert_eq!(pw_lost.list().len(), 1);
+        let s = pw_lost.load_secrets(&id).unwrap();
+        assert_eq!(&s.psk[..], b"TopSecretPSK");
+        assert!(s.password.is_none());
+
+        let psk_lost = ProfileStore::open(
+            Some(path),
+            Arc::new(PickyProtector {
+                refuse: "TopSecret",
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            psk_lost.load_secrets(&id),
+            Err(StoreError::MissingSecret(_))
+        ));
     }
 
     #[test]

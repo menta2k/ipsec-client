@@ -66,6 +66,16 @@ They also include an IPC integration test against the real binary
 Linux GUI build dependencies: `libgtk-3-dev`, `libxdo-dev` and
 `libayatana-appindicator3-dev`.
 
+The Linux port (feature 002) is in progress. On a Windows machine, type-check and lint the
+Linux service code with:
+
+```sh
+rustup target add x86_64-unknown-linux-gnu
+cargo clippy --target x86_64-unknown-linux-gnu --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -- -D warnings
+```
+
+The GUI isn't included because `gtk-sys` needs the Linux GTK development files.
+
 ## Run
 
 ### GUI development on any OS (simulated tunnels)

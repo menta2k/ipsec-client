@@ -14,5 +14,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 getrandom.workspace = true
+# Machine-key secret protector (keyfile.rs).
+aes-gcm.workspace = true
 
 [dev-dependencies]

@@ -77,6 +77,11 @@ pub enum NetChange {
         if_id: u64,
         servers: Vec<Ipv4Addr>,
     },
+    /// Linux without systemd-resolved: the original `/etc/resolv.conf`,
+    /// journaled before the file is rewritten; reverting writes it back.
+    ResolvConf {
+        backup: String,
+    },
 }
 
 pub trait NetConfig: Send + Sync {
@@ -173,4 +178,30 @@ pub fn is_timeout(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolv_conf_change_round_trips() {
+        let c = NetChange::ResolvConf {
+            backup: "nameserver 192.0.2.53\nsearch lan\n".into(),
+        };
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains(r#""kind":"ResolvConf""#), "{s}");
+        assert_eq!(serde_json::from_str::<NetChange>(&s).unwrap(), c);
+    }
+
+    #[test]
+    fn journal_written_by_001_still_parses() {
+        let old = r#"[
+            {"kind":"AdapterAddress","if_id":7,"addr":"10.0.0.2","prefix":32},
+            {"kind":"Route","if_id":7,"dest":"0.0.0.0","prefix":1,"next_hop":"0.0.0.0"},
+            {"kind":"Dns","if_id":7,"servers":["10.0.0.53"]}
+        ]"#;
+        let v: Vec<NetChange> = serde_json::from_str(old).unwrap();
+        assert_eq!(v.len(), 3);
+    }
 }

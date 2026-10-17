@@ -12,6 +12,7 @@
 
 pub mod datapath;
 pub mod events;
+pub mod keyfile;
 pub mod logbuf;
 pub mod manager;
 pub mod mock;

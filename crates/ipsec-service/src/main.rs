@@ -3,6 +3,7 @@
 //! See contracts/service-cli.md for the command line.
 
 mod host;
+mod linux;
 mod logging;
 mod paths;
 mod server;
