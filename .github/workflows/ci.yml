@@ -104,7 +104,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             strongswan-swanctl charon-systemd libcharon-extra-plugins \
-            libstrongswan-extra-plugins iproute2 iputils-ping
+            libstrongswan-extra-plugins libstrongswan-standard-plugins \
+            libcharon-extauth-plugins iproute2 iputils-ping
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the service and the e2e driver
