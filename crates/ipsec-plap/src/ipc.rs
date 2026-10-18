@@ -115,8 +115,11 @@ impl Default for PipeApi {
 }
 
 impl PipeApi {
-    /// The real service endpoint.
+    /// The real service endpoint, whose owner is verified before anything is
+    /// sent to it.
     pub fn new() -> Self {
+        #[cfg(windows)]
+        ipc_proto::client::set_pipe_owner_probe(crate::pipe_owner::owner_sid);
         Self::with(Arc::new(connect_stream), CALL_LIMIT)
     }
 

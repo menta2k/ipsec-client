@@ -9,3 +9,8 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Safe SO_PEERCRED and geteuid: clients only use the per-user socket if its
+# listener runs as the same user (keeps this crate free of `unsafe`).
+rustix = { version = "1.1.5", features = ["net", "process"] }

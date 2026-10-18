@@ -294,7 +294,7 @@ impl ConnectionManager {
         };
         *state = new_state.clone();
         drop(state);
-        info!(target: TARGET, profile = %plan.profile.name, origin, "connect requested");
+        info!(target: TARGET, profile = ?plan.profile.name, origin, "connect requested");
         self.shared.bus.publish(Event::State { state: new_state });
         self.cmd_tx
             .lock()

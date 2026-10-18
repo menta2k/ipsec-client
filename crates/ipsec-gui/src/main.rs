@@ -9,6 +9,8 @@ mod app;
 mod conn;
 mod icon;
 mod icon_export;
+#[cfg(windows)]
+mod pipe_owner;
 mod tray;
 mod views;
 
@@ -32,6 +34,9 @@ fn main() -> eframe::Result {
         // Sound: first thing in main, before any thread exists.
         std::env::remove_var("WAYLAND_DISPLAY");
     }
+    // Verify who serves the service pipe before sending it anything.
+    #[cfg(windows)]
+    ipc_proto::client::set_pipe_owner_probe(pipe_owner::owner_sid);
     // Packaging helper (not for users): write the PNG icon theme and exit.
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--write-icons") {

@@ -241,6 +241,13 @@ pub struct ResponderConfig {
     pub silent_after_established: bool,
     /// Never answer IKE_SA_INIT (unreachable test).
     pub ignore_sa_init: bool,
+    /// Impostor test: answer the MS-CHAPv2 response with EAP-Success directly,
+    /// skipping the MS-CHAPv2 Success (authenticator response).
+    pub skip_mschap_success: bool,
+    /// Impostor test: omit the gateway AUTH from the final EAP IKE_AUTH reply.
+    pub omit_final_auth: bool,
+    /// Impostor test: key the final EAP gateway AUTH with the PSK, not the MSK.
+    pub final_auth_with_psk: bool,
 }
 
 impl Default for ResponderConfig {
@@ -256,6 +263,9 @@ impl Default for ResponderConfig {
             esp_cbc: false,
             silent_after_established: false,
             ignore_sa_init: false,
+            skip_mschap_success: false,
+            omit_final_auth: false,
+            final_auth_with_psk: false,
         }
     }
 }
@@ -393,6 +403,27 @@ impl MockResponder {
             &[raw(PayloadType::Delete, del.encode())],
         );
         let _ = self.natt_sock.send_to(&marker(&msg), peer);
+    }
+
+    /// Send a gateway-initiated empty INFORMATIONAL request (a liveness
+    /// check) with message id `msg_id`. Returns the datagram so a test can
+    /// replay it.
+    pub fn send_liveness_check(&self, msg_id: u32) -> Option<Vec<u8>> {
+        let g = self.sa.lock().unwrap();
+        let sa = g.as_ref()?;
+        let peer = sa.peer?;
+        let msg = encrypt_resp(sa, ExchangeType::Informational as u8, 0, msg_id, &[]);
+        let dgram = marker(&msg);
+        let _ = self.natt_sock.send_to(&dgram, peer);
+        Some(dgram)
+    }
+
+    /// Re-send a datagram captured earlier, as an on-path attacker would.
+    pub fn replay(&self, dgram: &[u8]) {
+        let g = self.sa.lock().unwrap();
+        if let Some(peer) = g.as_ref().and_then(|sa| sa.peer) {
+            let _ = self.natt_sock.send_to(dgram, peer);
+        }
     }
 }
 
@@ -809,7 +840,17 @@ fn handle_natt(
                             cfg.username.as_bytes(),
                             &cfg.password,
                         );
-                        if expect == ntr {
+                        if expect == ntr && cfg.skip_mschap_success {
+                            sa.msk = Some(eap::eap_msk(&cfg.password, &ntr));
+                            sa.stage = EapStage::AwaitAuth;
+                            let r = Eap {
+                                code: eap::EAP_SUCCESS,
+                                identifier: 3,
+                                type_: None,
+                                data: vec![],
+                            };
+                            vec![raw(PayloadType::Eap, r.encode())]
+                        } else if expect == ntr {
                             sa.msk = Some(eap::eap_msk(&cfg.password, &ntr));
                             let s = eap::generate_authenticator_response(
                                 &cfg.password,
@@ -867,7 +908,13 @@ fn handle_natt(
                     vec![raw(PayloadType::Notify, n.encode())]
                 } else {
                     let id = gw_id();
-                    let mut v = vec![responder_auth(sa, &msk, &id)];
+                    let mut v = if cfg.omit_final_auth {
+                        vec![]
+                    } else if cfg.final_auth_with_psk {
+                        vec![responder_auth(sa, &cfg.psk, &id)]
+                    } else {
+                        vec![responder_auth(sa, &msk, &id)]
+                    };
                     v.extend(established_payloads(sa, cfg));
                     sa.stage = EapStage::Done;
                     obs.lock().unwrap().established = true;

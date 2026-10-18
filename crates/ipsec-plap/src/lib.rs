@@ -9,6 +9,10 @@
 //!   all behaviour and are unit-tested on any OS.
 //! * The COM layer (Windows only) is a thin shell over them; it never lets a
 //!   panic reach LogonUI and never blocks its UI thread (research R2).
+//! * `pipe_owner` (Windows only) is an OS binding: the service pipe's owner,
+//!   checked before anything is sent to it.
 
 pub mod ipc;
 pub mod logic;
+#[cfg(windows)]
+mod pipe_owner;

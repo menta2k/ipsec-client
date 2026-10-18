@@ -18,6 +18,9 @@ tracing.workspace = true
 # COM interfaces and #[implement] for the credential provider (003 research R1).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    # Owner check of the service's named pipe (src/pipe_owner.rs).
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_UI_Shell",

@@ -90,11 +90,13 @@ pub fn start(mode: Mode, console: bool) -> io::Result<Host> {
 
 #[cfg(windows)]
 fn mock_listener() -> io::Result<Arc<dyn Listener>> {
-    use crate::windows::pipe::{PipeListener, PIPE_SDDL};
+    use crate::windows::pipe::{PipeListener, MOCK_PIPE_SDDL};
     // `endpoint()` honours IPSEC_CLIENT_PIPE so tests can run beside an
-    // installed service.
+    // installed service. Clients refuse the service's own name when the
+    // owner is not SYSTEM or Administrators, so a mock that clients should use
+    // needs IPSEC_CLIENT_PIPE too.
     let pipe = ipc_proto::client::endpoint();
-    let l = PipeListener::bind(&pipe.to_string_lossy(), PIPE_SDDL).map_err(|e| {
+    let l = PipeListener::bind(&pipe.to_string_lossy(), MOCK_PIPE_SDDL).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("cannot open the IPC pipe (is the real service running?): {e}"),
@@ -141,7 +143,9 @@ fn real_parts(
     ring: &LogBuffer,
 ) -> io::Result<Parts> {
     use crate::windows::{
-        dpapi::DpapiProtector, netconfig::IpHelperNetConfig, pipe, secure_dir,
+        dpapi::{DpapiProtector, Scope},
+        netconfig::IpHelperNetConfig,
+        pipe, secure_dir,
         wintun_tun::WintunFactory,
     };
     use vpn_core::traits::{FileJournal, StdUdpFactory};
@@ -162,10 +166,32 @@ fn real_parts(
     // accepting clients.
     vpn_core::manager::recover(tun.as_ref(), net.as_ref(), journal.as_ref());
 
+    // F8: as LocalSystem, secrets are sealed with SYSTEM's own DPAPI key and
+    // older machine-scope ones are re-sealed now. `run` (an administrator)
+    // cannot open those and keeps machine scope.
+    let protector = DpapiProtector::for_this_process();
+    let account_scope = protector.scope() == Scope::Account;
+    if !account_scope {
+        tracing::warn!(
+            target: "host",
+            "not running as LocalSystem: secrets saved by the service cannot be read here, and new ones are sealed machine-wide until the service next starts"
+        );
+    }
     let store = Arc::new(
-        ProfileStore::open(Some(dir.join("profiles.json")), Arc::new(DpapiProtector))
+        ProfileStore::open(Some(dir.join("profiles.json")), Arc::new(protector))
             .map_err(store_io)?,
     );
+    if account_scope {
+        match store.reseal_legacy() {
+            Ok(0) => {}
+            Ok(n) => {
+                info!(target: "host", count = n, "re-sealed machine-scope secrets under the service account")
+            }
+            Err(e) => {
+                tracing::warn!(target: "host", error = %e, "could not re-seal machine-scope secrets")
+            }
+        }
+    }
     let mgr = ConnectionManager::start(Deps {
         udp: Arc::new(StdUdpFactory),
         tun,

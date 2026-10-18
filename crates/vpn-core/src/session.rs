@@ -261,6 +261,16 @@ fn find(payloads: &[RawPayload], t: PayloadType) -> Option<&RawPayload> {
     payloads.iter().find(|p| p.payload_type == t as u8)
 }
 
+/// Relative strength of a supported DH group (higher is stronger):
+/// Curve25519 > MODP-2048 > MODP-1536. Used to refuse INVALID_KE downgrades.
+fn dh_strength(g: DhGroup) -> u8 {
+    match g {
+        DhGroup::Modp1536 => 0,
+        DhGroup::Modp2048 => 1,
+        DhGroup::Curve25519 => 2,
+    }
+}
+
 /// Establish the IKE SA and Child SA. Blocking; honours `cancel`.
 pub fn establish(
     udp: &dyn UdpFactory,
@@ -357,6 +367,19 @@ pub fn establish(
         if let Some(n) = ike::notify::first_error(&msg.payloads) {
             if n.notify_type == notify::INVALID_KE_PAYLOAD && !ke_retry_done {
                 if let Some(g) = ike::notify::requested_dh_group(&n) {
+                    // The IKE_SA_INIT reply is unauthenticated: never let it
+                    // move us to a group weaker than the profile's (CWE-757).
+                    if dh_strength(g) < dh_strength(params.dh) {
+                        warn!(target: TARGET, configured = proposals::dh_name(params.dh), requested = proposals::dh_name(g), "gateway wants a weaker DH group than configured; refusing to downgrade");
+                        return Err(SessionError::new(
+                            ErrorCode::InvalidKe,
+                            format!(
+                                "The gateway requires DH group {}, which is weaker than the configured {} (INVALID_KE_PAYLOAD)",
+                                proposals::dh_name(g),
+                                proposals::dh_name(params.dh)
+                            ),
+                        ));
+                    }
                     warn!(target: TARGET, requested = proposals::dh_name(g), "gateway wants another DH group; retrying");
                     dh = g;
                     ke_retry_done = true;
@@ -580,6 +603,10 @@ fn eap_auth(
     init.verify_responder_psk_auth(&inner)
         .map_err(gateway_auth_error)?;
     info!(target: TARGET, "<= IKE_AUTH #1 (gateway AUTH verified)");
+    // The final MSK-keyed AUTH is computed over this IDr (RFC 7296 §2.16).
+    let idr = find(&inner, PayloadType::Idr)
+        .cloned()
+        .ok_or_else(|| gateway_auth_error(ike::sa::Error::MissingPayload(PayloadType::Idr)))?;
 
     let mut eap_bytes = find(&inner, PayloadType::Eap)
         .map(|p| p.data.clone())
@@ -591,6 +618,8 @@ fn eap_auth(
         })?;
     let mut msg_id = 2u32;
     let mut mschap: Option<(eap::MsChapResponse, [u8; 16])> = None;
+    // Set only once the gateway's MS-CHAPv2 authenticator response verifies.
+    let mut authenticator_verified = false;
     let mut rounds = 0;
 
     loop {
@@ -606,6 +635,12 @@ fn eap_auth(
         })?;
         match pkt.code {
             eap::EAP_SUCCESS => {
+                if !authenticator_verified {
+                    return Err(SessionError::new(
+                        ErrorCode::GatewayAuthFailed,
+                        "Gateway authentication failed: EAP-Success without a verified MS-CHAPv2 authenticator response",
+                    ));
+                }
                 info!(target: TARGET, "<= EAP-Success");
                 break;
             }
@@ -639,6 +674,7 @@ fn eap_auth(
                                     username,
                                 );
                                 mschap = Some((r, ac));
+                                authenticator_verified = false;
                                 info!(target: TARGET, "EAP-MSCHAPv2 challenge answered");
                                 (eap::TYPE_MSCHAPV2, data)
                             }
@@ -659,6 +695,7 @@ fn eap_auth(
                                         "Gateway authentication failed: invalid MS-CHAPv2 authenticator response",
                                     ));
                                 }
+                                authenticator_verified = true;
                                 info!(target: TARGET, "EAP-MSCHAPv2 success (authenticator verified)");
                                 (eap::TYPE_MSCHAPV2, vec![eap::MS_SUCCESS])
                             }
@@ -734,12 +771,14 @@ fn eap_auth(
     let fr = wire.exchange(&fm, init.initiator_spi(), msg_id)?;
     msg_id += 1;
     let inner = decrypt_reply(init, &fr, true)?;
-    // If the gateway repeats IDr + an MSK-keyed AUTH, it must verify. (The
-    // gateway identity itself was already verified in round #1.)
-    if find(&inner, PayloadType::Auth).is_some() && find(&inner, PayloadType::Idr).is_some() {
-        init.verify_responder_auth_with_key(&inner, &r.msk)
-            .map_err(gateway_auth_error)?;
-    }
+    // The gateway's MSK-keyed AUTH is mandatory: it is what proves the gateway
+    // knows the user's credential, not just the shared PSK. Per RFC 7296 §2.16
+    // this reply carries AUTH without IDr, so verify it over IKE_AUTH #1's IDr.
+    let auth = find(&inner, PayloadType::Auth)
+        .cloned()
+        .ok_or_else(|| gateway_auth_error(ike::sa::Error::MissingPayload(PayloadType::Auth)))?;
+    init.verify_responder_auth_with_key(&[idr, auth], &r.msk)
+        .map_err(gateway_auth_error)?;
     info!(target: TARGET, "<= IKE_AUTH (EAP complete)");
     Ok((inner, msg_id))
 }
@@ -849,4 +888,15 @@ fn finish(
         ike_suite,
         esp_suite: cipher.name().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dh_strength_orders_groups() {
+        assert!(dh_strength(DhGroup::Curve25519) > dh_strength(DhGroup::Modp2048));
+        assert!(dh_strength(DhGroup::Modp2048) > dh_strength(DhGroup::Modp1536));
+    }
 }

@@ -19,14 +19,12 @@ workspace with no dependency on the prototype crates:
 - **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun or a Linux TUN device.
 - **Liveness and teardown**: keepalives, DPD, and an IKE DELETE on disconnect.
 
-The specs (Spec Kit) are:
+The work is organised in features:
 
-- [`specs/001-ipsec-vpn-client/`](specs/001-ipsec-vpn-client/): the Windows client
-- [`specs/002-linux-support/`](specs/002-linux-support/): the Linux service and desktop
-- [`specs/003-pre-login-connect/`](specs/003-pre-login-connect/): connecting from the Windows
-  sign-in screen
-
-The project's principles are in [`.specify/memory/constitution.md`](.specify/memory/constitution.md).
+- 001: the Windows client
+- 002: the Linux service and desktop
+- 003: connecting from the Windows sign-in screen (Pre-Login Connect)
+- 004: macOS (planned)
 
 ## Architecture
 
@@ -47,8 +45,8 @@ The project's principles are in [`.specify/memory/constitution.md`](.specify/mem
 | `crates/ipc-proto` | GUI↔service messages, framing, blocking client | forbidden |
 | `crates/vpn-core` | Session driver, data path, state machine, profile store, mocks | forbidden |
 | `crates/ipsec-service` | IPC server and host. Windows: SCM, Wintun, IP Helper, DPAPI, pipe. Linux: systemd, TUN, iproute2/resolvectl, Unix socket. | `src/windows/` and `src/linux/sys.rs` only |
-| `crates/ipsec-gui` | eframe window + tray-icon + notifications | none |
-| `crates/ipsec-plap` | Pre-Login Connect: the sign-in screen provider DLL (logic and bounded IPC done; COM layer pending) | COM layer only (not yet written) |
+| `crates/ipsec-gui` | eframe window + tray-icon + notifications | `src/pipe_owner.rs` (Windows) only |
+| `crates/ipsec-plap` | Pre-Login Connect: the sign-in screen provider DLL (logic and bounded IPC done; COM layer pending) | `src/pipe_owner.rs` and the COM layer (not yet written), Windows only |
 
 On Linux the service listens on `/run/ipsec-client/ipsec-client.sock`. The socket's permissions
 admit only root and the `ipsec-client` group.
@@ -91,9 +89,13 @@ CI (`.github/workflows/ci.yml`) runs these jobs:
 
 - **Windows and Ubuntu 24.04 gates:** fmt, clippy and tests.
 - **The Linux root-only TUN test.**
-- **The `.deb`/`.rpm` build.**
 - **An end-to-end test against a real strongSwan gateway** in network namespaces
   (`sudo tests/linux-e2e/run.sh`).
+- **Installers**, uploaded as build artifacts:
+  - `windows-msi`: the MSI (Wintun 0.14.1 is downloaded and checksum-verified)
+  - `linux-packages`: the `.deb` and `.rpm`
+  - `macos-dmg`: an unsigned `.dmg` with a universal `IPsec Client.app`. Until the macOS
+    service back-end (004) exists, the app only drives `ipsec-service run --mock`.
 
 ## Run
 
@@ -102,6 +104,15 @@ CI (`.github/workflows/ci.yml`) runs these jobs:
 ```sh
 cargo run -p ipsec-service -- run --mock   # terminal 1
 cargo run -p ipsec-gui                     # terminal 2
+```
+
+On Windows, clients send nothing over `\\.\pipe\IpsecClient.v1` unless SYSTEM or
+Administrators own the pipe. That keeps passwords away from another user's process that
+took the name. A mock service runs as you, so on Windows give it a private pipe name, and set
+the same name in both terminals:
+
+```bat
+set IPSEC_CLIENT_PIPE=\\.\pipe\IpsecClient.dev
 ```
 
 In mock mode, a password of `fail` simulates an authentication failure, and the gateway
@@ -118,14 +129,16 @@ In mock mode, a password of `fail` simulates an authentication failure, and the 
 Other commands:
 
 - `ipsec-service run`: the service in a console, which is useful for debugging. Ctrl-C stops
-  it cleanly.
+  it cleanly. It runs as you, not as LocalSystem, so it cannot read secrets the installed
+  service saved: those profiles behave as if no secret were saved. Secrets saved in `run` are
+  machine-scope until the service next starts and re-seals them.
 - `ipsec-service stop`, `uninstall` and `cleanup`.
 
 Data lives in `%ProgramData%\IpsecClient`, which only SYSTEM and Administrators can access:
 
 | Path | Contents |
 |------|----------|
-| `profiles.json` | Profiles, with secrets DPAPI-encrypted |
+| `profiles.json` | Profiles, with secrets DPAPI-encrypted under the service account (LocalSystem) key |
 | `netstate.json` | The network-change journal |
 | `logs\` | Daily rotating logs |
 
@@ -138,7 +151,7 @@ service holds that port, it falls back to an ephemeral port.
 .\installer\build.ps1 -Wintun <path to wintun\bin\amd64\wintun.dll>
 ```
 
-The script needs the .NET SDK, and restores WiX 5 as a repo-local dotnet tool. It builds the
+The script needs the .NET SDK, and installs WiX 5 as a repo-local dotnet tool on first use. It builds the
 release binaries and writes `target\installer\IpsecClient-<version>-x64.msi`. Without
 `-Wintun`, it looks for `wintun.dll` in `target\release`, then `target\debug`.
 
@@ -225,15 +238,14 @@ recovery procedure, is [docs/pre-login-connect.md](docs/pre-login-connect.md).
     directions, and the status showed the full-tunnel routes and the VPN DNS servers. The
     routing table and DNS were not checked independently.
   - The MSI installer builds and passes validation.
-  - The formal real-tunnel checklist in [`quickstart.md`](specs/001-ipsec-vpn-client/quickstart.md)
-    is still open.
+  - The formal real-tunnel validation checklist is still open.
 - **Linux (002):**
   - The service code is written and lints cleanly for Linux: TUN, network and DNS
     configuration, machine-key secrets, systemd, the socket and the packages. The logic is
     unit-tested on every OS.
   - **Nothing has run on Linux yet.** The GUI's GTK tray code has never been compiled. CI and
-    the strongSwan end-to-end test will be the first runs, followed by
-    [`specs/002-linux-support/quickstart.md`](specs/002-linux-support/quickstart.md) on a VM.
+    the strongSwan end-to-end test will be the first runs, followed by a manual validation on a
+    VM.
 - **Pre-Login Connect (003):**
   - The service side is done, with tests: sign-in profiles, administrator checks, sign-out
     policy, the `plc` and `profile import` commands, and the sign-in logic and bounded IPC.

@@ -1786,6 +1786,7 @@ dependencies = [
 name = "ipc-proto"
 version = "0.1.0"
 dependencies = [
+ "rustix 1.1.5",
  "serde",
  "serde_json",
  "zeroize",
@@ -1803,6 +1804,7 @@ dependencies = [
  "png",
  "serde_json",
  "tray-icon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

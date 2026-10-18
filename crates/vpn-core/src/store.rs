@@ -139,6 +139,14 @@ impl ProfileStore {
             .ok_or(StoreError::NotFound)?;
         let mut p = list[idx].clone();
         p.apply_fields(edit);
+        // Saved secrets belong to the gateway and identity they were saved
+        // for. If the edit changes either, a `Keep` must not carry them over
+        // to an endpoint the editor chose: they are dropped (counted as not
+        // saved, so they are asked for again) unless the edit sets new ones.
+        if !same_target(&list[idx], &p) {
+            p.psk_blob = None;
+            p.password_blob = None;
+        }
         self.apply_secret(&mut p.psk_blob, &edit.psk)?;
         self.apply_secret(&mut p.password_blob, &edit.password)?;
         if p.auth == AuthMode::Psk {
@@ -244,6 +252,36 @@ impl ProfileStore {
         Ok(ProfileSecrets { psk, password })
     }
 
+    /// Re-seal every saved secret the protector reports as sealed in an
+    /// older form (F8: machine-scope DPAPI blobs). Secrets that do not open
+    /// are left untouched. Returns how many were re-sealed.
+    pub fn reseal_legacy(&self) -> Result<usize, StoreError> {
+        let mut list = self.profiles.lock().unwrap();
+        let mut n = 0;
+        for p in list.iter_mut() {
+            let name = p.name.clone();
+            for (what, slot) in [
+                ("pre-shared key", &mut p.psk_blob),
+                ("password", &mut p.password_blob),
+            ] {
+                let Some(hex) = slot.as_deref() else { continue };
+                let Some(raw) = from_hex(hex) else { continue };
+                if !self.protector.needs_reseal(&raw) {
+                    continue;
+                }
+                let Some(plain) = self.unprotect_or_warn(&name, what, hex) else {
+                    continue;
+                };
+                *slot = Some(to_hex(&self.protector.protect(&plain)?));
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.persist(&list)?;
+        }
+        Ok(n)
+    }
+
     fn unprotect_or_warn(
         &self,
         profile: &str,
@@ -254,7 +292,7 @@ impl ProfileStore {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(
-                    profile,
+                    ?profile,
                     error = %e,
                     "saved {what} cannot be decrypted; treating it as not saved"
                 );
@@ -310,6 +348,18 @@ impl ProfileStore {
     }
 }
 
+/// True if secrets saved for `a` may be used for `b`: both reach the same
+/// gateway and port with the same identity and authentication (the username
+/// only matters for EAP).
+fn same_target(a: &Profile, b: &Profile) -> bool {
+    a.gateway == b.gateway
+        && a.port == b.port
+        && a.local_id == b.local_id
+        && a.id_type == b.id_type
+        && a.auth == b.auth
+        && (a.auth == AuthMode::Psk || a.username == b.username)
+}
+
 /// Write a file atomically: temp file in the same directory, then rename.
 pub fn atomic_write(path: &Path, body: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -350,7 +400,7 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::mock::InsecureMockProtector;
-    use ipc_proto::{SecretString, SignInProfile};
+    use ipc_proto::{DhGroupSel, IdType, SecretString, SignInProfile};
 
     fn edit(name: &str) -> ProfileEdit {
         ProfileEdit {
@@ -389,6 +439,78 @@ mod tests {
             }
             Ok(plain)
         }
+    }
+
+    /// Seals like the mock protector with a `new:` prefix, and asks for any
+    /// blob without it to be re-sealed.
+    struct ResealingProtector;
+
+    impl SecretProtector for ResealingProtector {
+        fn protect(&self, plain: &[u8]) -> io::Result<Vec<u8>> {
+            Ok([b"new:", &InsecureMockProtector.protect(plain)?[..]].concat())
+        }
+        fn unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+            InsecureMockProtector.unprotect(blob.strip_prefix(b"new:").unwrap_or(blob))
+        }
+        fn needs_reseal(&self, blob: &[u8]) -> bool {
+            !blob.starts_with(b"new:")
+        }
+    }
+
+    #[test]
+    fn legacy_secrets_are_resealed_once_and_persisted() {
+        let path = temp_path("reseal");
+        let old = ProfileStore::open(Some(path.clone()), Arc::new(InsecureMockProtector)).unwrap();
+        let id = old.create(&edit("Office")).unwrap().id;
+        let psk_only = old
+            .create(&ProfileEdit {
+                password: SecretUpdate::Clear,
+                ..edit("Branch")
+            })
+            .unwrap()
+            .id;
+
+        let store = ProfileStore::open(Some(path.clone()), Arc::new(ResealingProtector)).unwrap();
+        assert_eq!(store.reseal_legacy().unwrap(), 3);
+        assert_eq!(store.reseal_legacy().unwrap(), 0);
+
+        // Persisted in the new form, and the secrets are unchanged.
+        let reopened = ProfileStore::open(Some(path), Arc::new(ResealingProtector)).unwrap();
+        assert_eq!(reopened.reseal_legacy().unwrap(), 0);
+        let p = reopened.get(&id).unwrap();
+        for b in [p.psk_blob.unwrap(), p.password_blob.unwrap()] {
+            assert!(from_hex(&b).unwrap().starts_with(b"new:"));
+        }
+        let s = reopened.load_secrets(&id).unwrap();
+        assert_eq!(&s.psk[..], b"TopSecretPSK");
+        assert_eq!(
+            s.password.as_deref().map(String::as_str),
+            Some("Hunter2Password")
+        );
+        assert!(reopened.get(&psk_only).unwrap().password_blob.is_none());
+    }
+
+    #[test]
+    fn reseal_skips_secrets_that_do_not_open() {
+        struct Refusing;
+        impl SecretProtector for Refusing {
+            fn protect(&self, plain: &[u8]) -> io::Result<Vec<u8>> {
+                ResealingProtector.protect(plain)
+            }
+            fn unprotect(&self, _: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "bad key"))
+            }
+            fn needs_reseal(&self, blob: &[u8]) -> bool {
+                ResealingProtector.needs_reseal(blob)
+            }
+        }
+        let path = temp_path("reseal-skip");
+        let old = ProfileStore::open(Some(path.clone()), Arc::new(InsecureMockProtector)).unwrap();
+        let id = old.create(&edit("Office")).unwrap().id;
+        let before = old.get(&id).unwrap().psk_blob;
+        let store = ProfileStore::open(Some(path), Arc::new(Refusing)).unwrap();
+        assert_eq!(store.reseal_legacy().unwrap(), 0);
+        assert_eq!(store.get(&id).unwrap().psk_blob, before);
     }
 
     #[test]
@@ -532,6 +654,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn keep_secrets(mut e: ProfileEdit) -> ProfileEdit {
+        e.psk = SecretUpdate::Keep;
+        e.password = SecretUpdate::Keep;
+        e
+    }
+
+    #[test]
+    fn retargeting_edit_drops_kept_secrets() {
+        // F9: secrets saved for one gateway/identity must not follow an edit
+        // that points the profile somewhere else.
+        type Mutate = Box<dyn Fn(&mut ProfileEdit)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            (
+                "gateway",
+                Box::new(|e| e.gateway = "evil.example.net".into()),
+            ),
+            ("port", Box::new(|e| e.port = 4500)),
+            ("local_id", Box::new(|e| e.local_id = "other".into())),
+            ("id_type", Box::new(|e| e.id_type = IdType::Email)),
+            ("username", Box::new(|e| e.username = "mallory".into())),
+            ("auth", Box::new(|e| e.auth = AuthMode::Psk)),
+        ];
+        for (what, mutate) in cases {
+            let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+            let id = store.create(&edit("Office")).unwrap().id;
+            let mut e = keep_secrets(edit("Office"));
+            mutate(&mut e);
+            let v = store.update(&id, &e).unwrap();
+            assert!(!v.has_psk && !v.has_password, "{what}: secrets kept");
+            assert!(
+                matches!(store.load_secrets(&id), Err(StoreError::MissingSecret(_))),
+                "{what}: stored PSK still usable"
+            );
+        }
+
+        // Import updates the same way.
+        let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+        store.create(&edit("Office")).unwrap();
+        let mut e = keep_secrets(edit("Office"));
+        e.gateway = "evil.example.net".into();
+        let v = store.import(&e, false).unwrap();
+        assert!(!v.has_psk && !v.has_password);
+    }
+
+    #[test]
+    fn retargeting_edit_stores_newly_set_secrets() {
+        let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+        let id = store.create(&edit("Office")).unwrap().id;
+        let mut e = keep_secrets(edit("Office"));
+        e.gateway = "vpn2.example.com".into();
+        e.psk = SecretUpdate::Set(SecretString::new("NewPSK"));
+        let v = store.update(&id, &e).unwrap();
+        assert!(v.has_psk && !v.has_password, "only the new PSK is kept");
+        let s = store.load_secrets(&id).unwrap();
+        assert_eq!(&s.psk[..], b"NewPSK");
+        assert!(s.password.is_none());
+    }
+
+    #[test]
+    fn edits_on_the_same_target_keep_secrets() {
+        let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+        let id = store.create(&edit("Office")).unwrap().id;
+        let mut e = keep_secrets(edit("Office HQ"));
+        e.gateway = "  vpn.example.com ".into();
+        e.username = " alice".into();
+        e.dh_group = DhGroupSel::X25519;
+        e.auto_reconnect = true;
+        let v = store.update(&id, &e).unwrap();
+        assert!(v.has_psk && v.has_password);
+        let s = store.load_secrets(&id).unwrap();
+        assert_eq!(&s.psk[..], b"TopSecretPSK");
+        assert_eq!(
+            s.password.as_deref().map(|p| p.as_str()),
+            Some("Hunter2Password")
+        );
+
+        // For PSK profiles the (ignored) username does not matter.
+        let mut psk = edit("Branch");
+        psk.auth = AuthMode::Psk;
+        let id = store.create(&psk).unwrap().id;
+        let mut e = keep_secrets(psk);
+        e.username = "someone-else".into();
+        assert!(store.update(&id, &e).unwrap().has_psk);
+    }
+
     #[test]
     fn name_unique_case_insensitive() {
         let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
@@ -557,6 +764,34 @@ mod tests {
             store.load_secrets(&v.id),
             Err(StoreError::MissingSecret(_))
         ));
+    }
+
+    #[test]
+    fn names_with_line_breaks_rejected_but_old_files_still_open() {
+        let store = ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap();
+        let field = |r: Result<ProfileView, StoreError>| match r {
+            Err(StoreError::Invalid(e)) => e.field,
+            other => panic!("expected an invalid-field error, got {other:?}"),
+        };
+        assert_eq!(field(store.create(&edit("Office\nFAKE"))), "name");
+        let v = store.create(&edit("Office")).unwrap();
+        assert_eq!(field(store.update(&v.id, &edit("Office\r\nFAKE"))), "name");
+        assert_eq!(field(store.import(&edit("Home\nFAKE"), true)), "name");
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.get(&v.id).unwrap().name, "Office");
+
+        // Stored profiles are not re-validated on load.
+        let path = temp_path("ctrlname");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"version":1,"profiles":[{"id":"p1","name":"Old\nname","gateway":"g","port":500,
+               "local_id":"l","id_type":"fqdn","dh_group":"modp2048","auth":"psk"}]}"#,
+        )
+        .unwrap();
+        let old = ProfileStore::open(Some(path.clone()), Arc::new(InsecureMockProtector)).unwrap();
+        assert_eq!(old.list()[0].name, "Old\nname");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

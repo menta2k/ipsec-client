@@ -9,6 +9,7 @@ use ipc_proto::*;
 use std::io;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use vpn_core::logbuf::LOG_REPLY_BYTES;
 use vpn_core::store::StoreError;
 use vpn_core::{EventBus, LogBuffer, ProfileStore, RejectError, SettingsStore};
 
@@ -130,12 +131,33 @@ pub fn run_accept_loop(
     }
 }
 
+/// Longest error text, in bytes, that a client's frame can put in a log field.
+const PEER_ERROR_MAX: usize = 512;
+
+/// A frame-read error made safe to log (CWE-117). serde quotes the client's
+/// own text in its messages (an unknown `type` or `op` value, CR/LF
+/// included), so every non-printable character is escaped and the text is
+/// capped, cut between characters, never inside an escape.
+fn peer_error(e: &io::Error) -> String {
+    let mut out = String::new();
+    for c in e.to_string().chars() {
+        let end = out.len();
+        out.extend(c.escape_debug());
+        if out.len() > PEER_ERROR_MAX {
+            out.truncate(end);
+            out.push_str(" [truncated]");
+            break;
+        }
+    }
+    out
+}
+
 /// Serve one client connection until it closes.
 pub fn serve(mut stream: Box<dyn Stream>, peer: Peer, ctx: &ServerCtx) {
     let client = match server_handshake(&mut stream, &ctx.service_name) {
         Ok(c) => c,
         Err(e) => {
-            debug!(target: "ipc", error = %e, "handshake rejected");
+            debug!(target: "ipc", error = %peer_error(&e), "handshake rejected");
             return;
         }
     };
@@ -145,7 +167,7 @@ pub fn serve(mut stream: Box<dyn Stream>, peer: Peer, ctx: &ServerCtx) {
             Ok(f) => f,
             Err(e) => {
                 if e.kind() == io::ErrorKind::InvalidData {
-                    warn!(target: "ipc", error = %e, "malformed frame; closing connection");
+                    warn!(target: "ipc", error = %peer_error(&e), "malformed frame; closing connection");
                 }
                 return;
             }
@@ -211,10 +233,15 @@ fn admin_required() -> Response {
 /// Dispatch one request. `peer` decides administrator-only operations;
 /// `client` is the self-reported name from `Hello`, used for logging only.
 pub fn handle(req: Request, peer: &Peer, client: &str, ctx: &ServerCtx) -> Response {
-    let admin_only = matches!(
-        req,
-        Request::SetSignIn { .. } | Request::SetPolicy { .. } | Request::ImportProfile { .. }
-    );
+    let admin_only = match &req {
+        Request::SetSignIn { .. } | Request::SetPolicy { .. } | Request::ImportProfile { .. } => {
+            true
+        }
+        // A profile offered at the sign-in screen is connected as LocalSystem
+        // there, so what it connects to is an administrator's decision (003).
+        Request::UpdateProfile { id, .. } => ctx.store.get(id).is_some_and(|p| p.sign_in),
+        _ => false,
+    };
     if admin_only && !peer.is_admin {
         warn!(target: "ipc", client, peer = %peer.desc, "administrator request refused");
         return admin_required();
@@ -275,7 +302,9 @@ pub fn handle(req: Request, peer: &Peer, client: &str, ctx: &ServerCtx) -> Respo
             Err(e) => reject(e),
         },
         Request::GetLogs { max } => Response::Logs {
-            lines: ctx.logs.recent(max.min(MAX_LOG_LINES) as usize),
+            lines: ctx
+                .logs
+                .recent_within(max.min(MAX_LOG_LINES) as usize, LOG_REPLY_BYTES),
         },
         Request::Subscribe => Response::Failed {
             code: RequestError::Invalid,
@@ -293,7 +322,7 @@ pub fn handle(req: Request, peer: &Peer, client: &str, ctx: &ServerCtx) -> Respo
         }
         Request::SetSignIn { id, enabled } => match ctx.store.set_sign_in(&id, enabled) {
             Ok(v) => {
-                info!(target: "ipc", name = %v.name, enabled, peer = %peer.desc, "sign-in availability changed");
+                info!(target: "ipc", name = ?v.name, enabled, peer = %peer.desc, "sign-in availability changed");
                 ctx.bus.publish(Event::ProfilesChanged);
                 Response::Profile { profile: v }
             }
@@ -330,11 +359,14 @@ fn stream_events(mut stream: Box<dyn Stream>, ctx: &ServerCtx) {
     let snapshot = Response::Subscribed {
         state: ctx.engine.state(),
         session: ctx.engine.session(),
-        recent_logs: ctx.logs.recent(500),
+        recent_logs: ctx.logs.recent_within(500, LOG_REPLY_BYTES),
     };
     if write_frame(&mut stream, &Frame::Response { body: snapshot }).is_err() {
         return;
     }
+    // `recv` also fails once the bus has dropped this subscriber for falling
+    // a full queue behind (`vpn_core::events::SUBSCRIBER_QUEUE_LIMIT`); the
+    // stream is then closed and the client must resubscribe.
     while let Ok(ev) = rx.recv() {
         if write_frame(&mut stream, &Frame::Event { body: ev }).is_err() {
             return;
@@ -518,6 +550,130 @@ mod tests {
         );
     }
 
+    /// A maximum-size self-reported client name is cut in the audit lines
+    /// and cannot push the OS-attested peer out of them.
+    #[test]
+    fn huge_client_name_is_bounded_and_keeps_peer() {
+        use tracing_subscriber::prelude::*;
+        use vpn_core::logbuf::{MAX_FIELD_BYTES, MAX_LINE_BYTES, TRUNCATED};
+        let (ctx, _) = ctx();
+        let id = ctx.store.create(&edit()).unwrap().id;
+        let peer = Peer {
+            is_admin: false,
+            desc: "pid=4242 user=TEST\\alice".into(),
+        };
+        let client = "c".repeat(ipc_proto::framing::MAX_FRAME);
+        let sub = tracing_subscriber::registry().with(ctx.logs.layer());
+        tracing::subscriber::with_default(sub, || {
+            handle(
+                Request::SetPolicy {
+                    policy: Policy {
+                        keep_tunnel_on_signout: true,
+                    },
+                },
+                &peer,
+                &client,
+                &ctx,
+            );
+            handle(
+                Request::Connect {
+                    id: id.clone(),
+                    password: None,
+                    save_password: false,
+                },
+                &peer,
+                &client,
+                &ctx,
+            );
+        });
+        let lines = ctx.logs.recent(50);
+        let find = |start: &str| {
+            lines
+                .iter()
+                .find(|l| l.message.starts_with(start))
+                .unwrap_or_else(|| panic!("no {start} line"))
+                .message
+                .clone()
+        };
+        let kept = format!(" client={}{TRUNCATED} ", "c".repeat(MAX_FIELD_BYTES));
+        for m in [
+            find("administrator request refused"),
+            find("connect requested"),
+        ] {
+            assert!(m.len() <= MAX_LINE_BYTES + TRUNCATED.len(), "{}", m.len());
+            assert!(m.contains(&kept), "client not cut");
+            assert!(m.contains(" peer=pid=4242 user=TEST\\alice"), "peer lost");
+        }
+        assert!(find("connect requested").ends_with(" origin=app"));
+    }
+
+    /// A ring full of maximum-size lines that escape worst on the wire is
+    /// still served in one frame by GetLogs and the Subscribe snapshot, and a
+    /// subscriber still receives such a line as a Log event.
+    #[test]
+    fn worst_case_log_replies_fit_one_frame() {
+        use ipc_proto::framing::MAX_FRAME;
+        use tracing_subscriber::prelude::*;
+        use vpn_core::logbuf::LOG_CAPACITY;
+        let bus = EventBus::new();
+        let ctx = Arc::new(ServerCtx {
+            engine: Arc::new(FakeEngine::default()),
+            store: Arc::new(ProfileStore::open(None, Arc::new(InsecureMockProtector)).unwrap()),
+            settings: Arc::new(SettingsStore::open(settings_path()).0),
+            bus: bus.clone(),
+            logs: LogBuffer::new(LOG_CAPACITY, Some(bus)),
+            service_name: "test".into(),
+        });
+        let peer = Peer {
+            is_admin: false,
+            desc: "pid=4242 user=TEST\\alice".into(),
+        };
+        // A control character takes six bytes once serialized.
+        let client = "\u{1}".repeat(MAX_FRAME);
+        let refused = || {
+            handle(
+                Request::SetPolicy {
+                    policy: Policy {
+                        keep_tunnel_on_signout: true,
+                    },
+                },
+                &peer,
+                &client,
+                &ctx,
+            )
+        };
+        let logging = tracing::Dispatch::new(tracing_subscriber::registry().with(ctx.logs.layer()));
+        tracing::dispatcher::with_default(&logging, || {
+            for _ in 0..LOG_CAPACITY {
+                refused();
+            }
+        });
+
+        let reply = Frame::Response {
+            body: handle(Request::GetLogs { max: MAX_LOG_LINES }, &peer, "t", &ctx),
+        };
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_FRAME);
+        match reply {
+            Frame::Response {
+                body: Response::Logs { lines },
+            } => {
+                assert!(!lines.is_empty());
+                assert!(lines.iter().all(|l| l.message.contains("peer=pid=4242")));
+            }
+            r => panic!("{r:?}"),
+        }
+
+        let (snap, mut events) = EventStream::over(Box::new(connect(&ctx)), "t").unwrap();
+        assert!(!snap.recent_logs.is_empty());
+        tracing::dispatcher::with_default(&logging, || {
+            refused();
+        });
+        match events.next_event().unwrap() {
+            Event::Log { line } => assert!(line.message.contains("peer=pid=4242")),
+            e => panic!("{e:?}"),
+        }
+    }
+
     #[test]
     fn admin_only_requests_are_refused_for_other_users() {
         let (ctx, _) = ctx();
@@ -551,6 +707,54 @@ mod tests {
         assert!(ctx.store.sign_in_profiles().is_empty());
         assert_eq!(ctx.settings.get(), Policy::default());
         assert_eq!(ctx.store.list().len(), 1);
+    }
+
+    #[test]
+    fn only_administrators_edit_sign_in_profiles() {
+        let (ctx, _) = ctx();
+        let id = ctx.store.create(&edit()).unwrap().id;
+        ctx.store.set_sign_in(&id, true).unwrap();
+        let mut repointed = edit();
+        repointed.gateway = "attacker.example".into();
+
+        let mut user = CommandClient::over(Box::new(connect_as(&ctx, false)), "t").unwrap();
+        assert_eq!(
+            failed_code(user.request(Request::UpdateProfile {
+                id: id.clone(),
+                profile: repointed.clone(),
+            })),
+            RequestError::AdminRequired
+        );
+        let kept = ctx.store.get(&id).unwrap();
+        assert!(kept.sign_in && kept.gateway == "vpn.example.com");
+
+        // Profiles not offered at sign-in stay editable by anyone.
+        let mut home = edit();
+        home.name = "Home".into();
+        let home_id = ctx.store.create(&home).unwrap().id;
+        home.gateway = "home.example.com".into();
+        assert!(matches!(
+            user.request(Request::UpdateProfile {
+                id: home_id,
+                profile: home,
+            })
+            .unwrap(),
+            Response::Profile { .. }
+        ));
+
+        let mut admin = CommandClient::over(Box::new(connect_as(&ctx, true)), "t").unwrap();
+        match admin
+            .request(Request::UpdateProfile {
+                id,
+                profile: repointed,
+            })
+            .unwrap()
+        {
+            Response::Profile { profile } => {
+                assert!(profile.sign_in && profile.gateway == "attacker.example")
+            }
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]
@@ -744,5 +948,107 @@ mod tests {
             c.request(Request::GetStatus).unwrap(),
             Response::Status { .. }
         ));
+    }
+
+    /// A client cannot forge log lines (CWE-117): serde quotes an unknown
+    /// `type` or `op` value, CR/LF and ESC included, in the error that is
+    /// logged for a bad first frame and for a bad request.
+    #[test]
+    fn malformed_frames_cannot_forge_log_lines() {
+        use std::io::{Cursor, Read, Write};
+        use tracing_subscriber::prelude::*;
+
+        /// A client that sends a fixed byte script and ignores the replies.
+        struct Scripted(Cursor<Vec<u8>>);
+        impl Read for Scripted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl Write for Scripted {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// What the log file layer writes.
+        #[derive(Clone, Default)]
+        struct File(Arc<Mutex<Vec<u8>>>);
+        impl Write for File {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn frame(json: serde_json::Value) -> Vec<u8> {
+            let body = json.to_string();
+            let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            bytes
+        }
+
+        const FORGED: &str = "\r\n2026-01-01T00:00:00Z  WARN ipc: forged\u{1b}[2J";
+        let hello = frame(serde_json::json!({
+            "type": "Hello",
+            "protocol_version": PROTOCOL_VERSION,
+            "client": "t",
+        }));
+        let bad_request = frame(serde_json::json!({
+            "type": "Request",
+            // Long enough that the logged error is capped.
+            "body": { "op": format!("GetStatus{FORGED}{}", "\n".repeat(4096)) },
+        }));
+        let scripts = [
+            // Rejected by the handshake; logged at DEBUG.
+            (
+                frame(serde_json::json!({ "type": format!("Hello{FORGED}") })),
+                "handshake rejected",
+            ),
+            // A good Hello, then a bad request; logged at WARN.
+            ([hello, bad_request].concat(), "malformed frame"),
+        ];
+
+        let (ctx, _) = ctx();
+        let file = File::default();
+        let writer = file.clone();
+        // No level filter: DEBUG and WARN both reach the ring and the file
+        // layer, configured as in `logging::init`.
+        let sub = tracing_subscriber::registry().with(ctx.logs.layer()).with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        tracing::subscriber::with_default(sub, || {
+            for (input, _) in &scripts {
+                let stream = Scripted(Cursor::new(input.clone()));
+                serve(Box::new(stream), Peer::default(), &ctx);
+            }
+        });
+
+        let file = String::from_utf8(file.0.lock().unwrap().clone()).unwrap();
+        let ring = ctx.logs.recent(100);
+        // One file line per event, and no raw control characters anywhere.
+        assert_eq!(file.lines().count(), ring.len(), "{file}");
+        assert!(!file.contains('\r') && !file.contains('\u{1b}'), "{file}");
+        assert!(
+            !ring.iter().any(|l| l.message.chars().any(char::is_control)),
+            "{ring:?}"
+        );
+        for (_, msg) in &scripts {
+            // The client's text is kept, escaped, on the event's own line.
+            let line = file.lines().find(|l| l.contains(msg)).expect(msg);
+            assert!(line.contains("forged"), "{file}");
+            let entry = ring.iter().find(|l| l.message.contains(msg)).expect(msg);
+            assert!(entry.message.contains("forged"), "{ring:?}");
+            assert!(entry.message.len() < PEER_ERROR_MAX + 100, "{ring:?}");
+        }
+        assert!(file.contains("[truncated]"), "{file}");
     }
 }

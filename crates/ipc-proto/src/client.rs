@@ -10,9 +10,81 @@ use crate::framing::{read_frame, write_frame};
 use crate::messages::*;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Windows named-pipe path of the service endpoint.
 pub const PIPE_NAME: &str = r"\\.\pipe\IpsecClient.v1";
+
+/// Owners (string SIDs) a client accepts for [`PIPE_NAME`]: LocalSystem and
+/// BUILTIN\Administrators. The service creates the pipe with owner
+/// Administrators (`O:BA`), and so does an elevated `ipsec-service run`.
+///
+/// Windows lets a process assign as owner only its own user or a group its
+/// token may assign as owner (or any SID with `SeRestorePrivilege`, which only
+/// privileged accounts hold), so an ordinary user cannot create a pipe owned by
+/// either. Owner and DACL belong to the pipe *name*: they are set by
+/// whoever creates the first instance, and every later instance shares them.
+/// The service's DACL gives only SYSTEM and Administrators
+/// `FILE_CREATE_PIPE_INSTANCE`, so nobody else can add instances next to the
+/// service's. Together this means an impostor can serve the name only by
+/// creating it while the service is not running, and then the owner gives it
+/// away.
+pub const TRUSTED_PIPE_OWNERS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
+
+/// Reports the owner SID (string form, e.g. `S-1-5-18`) of the named pipe
+/// behind an open client handle. Supplied by OS-binding code, because this
+/// crate has no `unsafe`.
+pub type PipeOwnerProbe = fn(&std::fs::File) -> io::Result<String>;
+
+static PIPE_OWNER_PROBE: OnceLock<PipeOwnerProbe> = OnceLock::new();
+
+/// Install the owner check used before anything is sent over [`PIPE_NAME`].
+/// Every Windows client binary calls this at startup (the GUI, the sign-in
+/// provider, the service CLI). Later calls are ignored. Without a probe,
+/// connecting to [`PIPE_NAME`] fails.
+pub fn set_pipe_owner_probe(probe: PipeOwnerProbe) {
+    let _ = PIPE_OWNER_PROBE.set(probe);
+}
+
+/// `SECURITY_IDENTIFICATION` for `CreateFile`: the server may learn who the
+/// client is but cannot act as the client.
+#[cfg(windows)]
+const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+
+/// True for the service's well-known name (pipe names are case-insensitive).
+/// Names from [`PIPE_ENV`] are not checked: tests and developers run their own
+/// unprivileged servers there, and only the user can set that variable.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_service_pipe(path: &std::path::Path) -> bool {
+    path.as_os_str().eq_ignore_ascii_case(PIPE_NAME)
+}
+
+/// Decide whether the server of [`PIPE_NAME`] may receive requests, from the
+/// owner the probe reported (`None`: no probe installed). Fails closed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn check_service_pipe_owner(owner: Option<io::Result<String>>) -> io::Result<()> {
+    let owner = match owner {
+        None => {
+            return Err(io::Error::other(format!(
+                "cannot verify who serves {PIPE_NAME}: no owner check installed"
+            )))
+        }
+        Some(Err(e)) => {
+            return Err(io::Error::other(format!(
+                "cannot verify who serves {PIPE_NAME}: {e}"
+            )))
+        }
+        Some(Ok(owner)) => owner,
+    };
+    if TRUSTED_PIPE_OWNERS.contains(&owner.as_str()) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "refusing {PIPE_NAME}: it is owned by {owner}, not by SYSTEM or Administrators, \
+             so it is not the IpsecClient service"
+        )))
+    }
+}
 
 /// Socket of the Linux system service (002 contracts/linux-system-integration.md).
 pub const SYSTEM_SOCKET: &str = "/run/ipsec-client/ipsec-client.sock";
@@ -85,23 +157,56 @@ fn user_socket(env: Env<'_>, tmp: &std::path::Path) -> PathBuf {
     tmp.join(format!("ipsec-client-{user}.sock"))
 }
 
+/// A candidate endpoint, tagged with how far it is trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Candidate {
+    /// Connected as is: the Windows pipe, the system socket in the
+    /// root-created runtime directory, or an explicit `IPSEC_CLIENT_SOCKET`.
+    Fixed(PathBuf),
+    /// The per-user (mock) socket. It may sit in a shared temp directory, so
+    /// it is only used if its listener runs as this user.
+    PerUser(PathBuf),
+}
+
+impl Candidate {
+    fn into_path(self) -> PathBuf {
+        match self {
+            Candidate::Fixed(p) | Candidate::PerUser(p) => p,
+        }
+    }
+}
+
 /// Linux: override, system socket, then the per-user (mock) socket.
 /// Windows keeps its single pipe; other Unixes have no system service.
+fn candidates(
+    os: Os,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    tmp: &std::path::Path,
+) -> Vec<Candidate> {
+    match os {
+        Os::Windows => vec![Candidate::Fixed(windows_pipe(&env))],
+        Os::Linux => {
+            let mut v: Vec<Candidate> = env(SOCKET_ENV)
+                .map(|p| Candidate::Fixed(PathBuf::from(p)))
+                .into_iter()
+                .collect();
+            v.push(Candidate::Fixed(PathBuf::from(SYSTEM_SOCKET)));
+            v.push(Candidate::PerUser(user_socket(&env, tmp)));
+            v
+        }
+        Os::OtherUnix => vec![Candidate::PerUser(user_socket(&env, tmp))],
+    }
+}
+
 fn endpoint_candidates(
     os: Os,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     tmp: &std::path::Path,
 ) -> Vec<PathBuf> {
-    match os {
-        Os::Windows => vec![windows_pipe(&env)],
-        Os::Linux => {
-            let mut v: Vec<PathBuf> = env(SOCKET_ENV).map(PathBuf::from).into_iter().collect();
-            v.push(PathBuf::from(SYSTEM_SOCKET));
-            v.push(user_socket(&env, tmp));
-            v
-        }
-        Os::OtherUnix => vec![user_socket(&env, tmp)],
-    }
+    candidates(os, env, tmp)
+        .into_iter()
+        .map(Candidate::into_path)
+        .collect()
 }
 
 /// A connected byte stream to the service.
@@ -126,11 +231,21 @@ fn classify(kind: io::ErrorKind) -> Attempt {
     }
 }
 
-/// Connect to the first reachable endpoint of `paths`.
-fn connect_first(paths: &[PathBuf]) -> io::Result<Box<dyn Stream>> {
+/// Connect to the first reachable endpoint of `candidates`.
+fn connect_first(candidates: &[Candidate]) -> io::Result<Box<dyn Stream>> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no service endpoint");
-    for p in paths {
-        match connect_stream_at(p) {
+    for c in candidates {
+        let r = match c {
+            Candidate::Fixed(p) => connect_stream_at(p),
+            #[cfg(unix)]
+            Candidate::PerUser(p) => connect_own(p, rustix::process::geteuid().as_raw()),
+            #[cfg(not(unix))]
+            Candidate::PerUser(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "per-user sockets exist only on Unix",
+            )),
+        };
+        match r {
             Ok(s) => return Ok(s),
             Err(e) if classify(e.kind()) == Attempt::TryNext => last = e,
             Err(e) => return Err(e),
@@ -139,9 +254,52 @@ fn connect_first(paths: &[PathBuf]) -> io::Result<Box<dyn Stream>> {
     Err(last)
 }
 
+/// Connect to a per-user socket, refusing it unless its listener runs as
+/// `me`. The check happens before anything is written, so a socket planted
+/// in a shared temp directory never receives a request (or its secrets).
+/// A refusal is `ErrorKind::Other`: the search stops there.
+#[cfg(unix)]
+fn connect_own(path: &std::path::Path, me: u32) -> io::Result<Box<dyn Stream>> {
+    let refuse = |uid: u32| {
+        io::Error::other(format!(
+            "refusing per-user socket {}: it belongs to uid {uid}, not to this user (uid {me})",
+            path.display()
+        ))
+    };
+    // macOS and the BSDs: rustix has no safe getpeereid, so check who owns
+    // the socket entry itself (without following a symlink).
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::symlink_metadata(path)?.uid();
+        if owner != me {
+            return Err(refuse(owner));
+        }
+    }
+    let s = std::os::unix::net::UnixStream::connect(path)?;
+    // Linux: ask the kernel who is actually listening (SO_PEERCRED).
+    #[cfg(target_os = "linux")]
+    {
+        let peer = rustix::net::sockopt::socket_peercred(&s).map_err(|e| {
+            io::Error::other(format!(
+                "refusing per-user socket {}: cannot read its listener's credentials ({e})",
+                path.display()
+            ))
+        })?;
+        if peer.uid.as_raw() != me {
+            return Err(refuse(peer.uid.as_raw()));
+        }
+    }
+    Ok(Box::new(s))
+}
+
 /// Open a raw stream to the service.
 pub fn connect_stream() -> io::Result<Box<dyn Stream>> {
-    connect_first(&endpoints())
+    connect_first(&candidates(
+        Os::current(),
+        |k| std::env::var_os(k),
+        &std::env::temp_dir(),
+    ))
 }
 
 /// How a failure to reach the service is reported.
@@ -152,30 +310,53 @@ fn connect_error(e: io::Error) -> ClientError {
     }
 }
 
-/// Open a raw stream to an explicit endpoint path.
+/// Open a raw stream to an explicit endpoint path. On Windows, the service's
+/// [`PIPE_NAME`] is accepted only after its owner passed
+/// [`TRUSTED_PIPE_OWNERS`], before a single byte is written.
 pub fn connect_stream_at(path: &std::path::Path) -> io::Result<Box<dyn Stream>> {
     #[cfg(windows)]
     {
-        // All pipe instances busy (ERROR_PIPE_BUSY = 231): retry briefly.
-        let mut tries = 0;
-        loop {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path)
-            {
-                Ok(f) => return Ok(Box::new(f)),
-                Err(e) if e.raw_os_error() == Some(231) && tries < 20 => {
-                    tries += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        open_pipe(path, is_service_pipe(path))
     }
     #[cfg(unix)]
     {
         Ok(Box::new(std::os::unix::net::UnixStream::connect(path)?))
+    }
+}
+
+/// Like [`connect_stream_at`] on [`PIPE_NAME`], but for any pipe path: the
+/// owner check is always applied. Lets tests exercise the check on private
+/// pipe names.
+#[cfg(windows)]
+pub fn connect_verified_pipe_at(path: &std::path::Path) -> io::Result<Box<dyn Stream>> {
+    open_pipe(path, true)
+}
+
+#[cfg(windows)]
+fn open_pipe(path: &std::path::Path, verify_owner: bool) -> io::Result<Box<dyn Stream>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // All pipe instances busy (ERROR_PIPE_BUSY = 231): retry briefly.
+    let mut tries = 0;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(path)
+        {
+            Ok(f) => {
+                if verify_owner {
+                    // On failure `f` is dropped unused: nothing was sent.
+                    check_service_pipe_owner(PIPE_OWNER_PROBE.get().map(|probe| probe(&f)))?;
+                }
+                return Ok(Box::new(f));
+            }
+            Err(e) if e.raw_os_error() == Some(231) && tries < 20 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -495,6 +676,51 @@ mod tests {
     }
 
     #[test]
+    fn only_the_service_name_gets_the_owner_check() {
+        assert!(is_service_pipe(std::path::Path::new(PIPE_NAME)));
+        assert!(is_service_pipe(std::path::Path::new(
+            r"\\.\PIPE\ipsecclient.V1"
+        )));
+        assert!(!is_service_pipe(std::path::Path::new(
+            r"\\.\pipe\IpsecClient.test.7"
+        )));
+    }
+
+    #[test]
+    fn service_pipe_must_be_owned_by_system_or_administrators() {
+        assert!(check_service_pipe_owner(Some(Ok("S-1-5-18".into()))).is_ok());
+        assert!(check_service_pipe_owner(Some(Ok("S-1-5-32-544".into()))).is_ok());
+        // An interactive user's own pipe (name squatted while the service is
+        // stopped), other well-known accounts, and junk are refused.
+        for owner in [
+            "S-1-5-21-1539688708-418911152-364561277-1001",
+            "S-1-5-19",
+            "S-1-5-20",
+            "S-1-5-4",
+            "S-1-5-32-545",
+            "S-1-5-18-1",
+            "",
+        ] {
+            let e = check_service_pipe_owner(Some(Ok(owner.into()))).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::Other, "{owner}");
+            assert!(e.to_string().contains("not the IpsecClient service"), "{e}");
+            // Not reported as "not authorized": that is a different banner.
+            assert!(matches!(connect_error(e), ClientError::Unavailable(_)));
+        }
+    }
+
+    #[test]
+    fn service_pipe_check_fails_closed() {
+        let e = check_service_pipe_owner(None).unwrap_err();
+        assert!(e.to_string().contains("no owner check installed"), "{e}");
+        let e =
+            check_service_pipe_owner(Some(Err(io::Error::from(io::ErrorKind::PermissionDenied))))
+                .unwrap_err();
+        assert!(e.to_string().contains("cannot verify"), "{e}");
+        assert!(matches!(connect_error(e), ClientError::Unavailable(_)));
+    }
+
+    #[test]
     fn refused_by_access_control_is_reported_as_unauthorized() {
         let e = connect_error(io::Error::from(io::ErrorKind::PermissionDenied));
         assert!(matches!(e, ClientError::Unauthorized), "{e:?}");
@@ -524,11 +750,121 @@ mod tests {
         let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o000)).unwrap();
         let fallback = dir.join("missing.sock");
-        let r = connect_first(&[sock.clone(), fallback]);
+        let r = connect_first(&[Candidate::Fixed(sock.clone()), Candidate::Fixed(fallback)]);
         assert_eq!(
             r.err().map(|e| e.kind()),
             Some(io::ErrorKind::PermissionDenied)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_per_user_socket_is_checked() {
+        let tmp = PathBuf::from("/tmp");
+        let lin = candidates(
+            Os::Linux,
+            env(&[("IPSEC_CLIENT_SOCKET", "/x/test.sock"), ("USER", "bob")]),
+            &tmp,
+        );
+        assert_eq!(
+            lin,
+            [
+                Candidate::Fixed(PathBuf::from("/x/test.sock")),
+                Candidate::Fixed(PathBuf::from(SYSTEM_SOCKET)),
+                Candidate::PerUser(PathBuf::from("/tmp/ipsec-client-bob.sock")),
+            ]
+        );
+        let mac = candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
+        assert_eq!(
+            mac,
+            [Candidate::PerUser(PathBuf::from("/r/ipsec-client.sock"))]
+        );
+        let win = candidates(Os::Windows, env(&[]), &tmp);
+        assert_eq!(win, [Candidate::Fixed(PathBuf::from(PIPE_NAME))]);
+    }
+
+    /// A fresh directory under the temp dir, with `mode`.
+    #[cfg(unix)]
+    fn scratch_dir(tag: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ipc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_per_user_socket_connects() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        // Straight in the (possibly shared) temp dir.
+        let shared = std::env::temp_dir().join(format!("ipc-own-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&shared);
+        let _l1 = UnixListener::bind(&shared).unwrap();
+        assert!(connect_first(&[Candidate::PerUser(shared.clone())]).is_ok());
+        let _ = std::fs::remove_file(&shared);
+        // In a private directory, like $XDG_RUNTIME_DIR.
+        let private = scratch_dir("own-private", 0o700);
+        let _l2 = UnixListener::bind(private.join("s.sock")).unwrap();
+        assert!(connect_first(&[Candidate::PerUser(private.join("s.sock"))]).is_ok());
+        let _ = std::fs::remove_dir_all(&private);
+        // In a directory this user owns but cannot write to: no file is
+        // created to learn who we are.
+        let ro = scratch_dir("own-ro", 0o700);
+        let _l3 = UnixListener::bind(ro.join("s.sock")).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = connect_first(&[Candidate::PerUser(ro.join("s.sock"))]);
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_ok(), "{:?}", r.err());
+        assert_eq!(std::fs::read_dir(&ro).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&ro);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_per_user_socket_is_refused_before_anything_is_written() {
+        use std::os::unix::net::UnixListener;
+        let dir = scratch_dir("foreign", 0o700);
+        let sock = dir.join("s.sock");
+        let l = UnixListener::bind(&sock).unwrap();
+        // Pretend to be someone else: the listener (this process) is then
+        // a different user.
+        let other = rustix::process::geteuid().as_raw().wrapping_add(1);
+        let e = connect_own(&sock, other).err().expect("must be refused");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert!(e.to_string().contains("refusing"), "{e}");
+        assert_eq!(classify(e.kind()), Attempt::Fail, "must not fall through");
+        assert!(matches!(connect_error(e), ClientError::Unavailable(_)));
+        // The listener got either no connection at all or one that carried
+        // zero bytes.
+        l.set_nonblocking(true).unwrap();
+        let received = match l.accept() {
+            Ok((mut s, _)) => {
+                s.set_nonblocking(false).unwrap();
+                let mut buf = Vec::new();
+                s.read_to_end(&mut buf).unwrap();
+                buf.len()
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(e) => panic!("{e}"),
+        };
+        assert_eq!(received, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_per_user_socket_still_falls_through() {
+        use std::os::unix::net::UnixListener;
+        let dir = scratch_dir("missing", 0o700);
+        let missing = dir.join("missing.sock");
+        let r = connect_first(&[Candidate::PerUser(missing.clone())]);
+        assert_eq!(r.err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        let good = dir.join("good.sock");
+        let _l = UnixListener::bind(&good).unwrap();
+        assert!(connect_first(&[Candidate::PerUser(missing), Candidate::Fixed(good)]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
     use std::net::{TcpListener, TcpStream};

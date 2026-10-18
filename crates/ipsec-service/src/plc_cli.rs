@@ -341,6 +341,9 @@ pub fn main(args: &[&str]) -> i32 {
             return 2;
         }
     };
+    // Verify who serves the pipe before sending profiles and secrets.
+    #[cfg(windows)]
+    ipc_proto::client::set_pipe_owner_probe(crate::windows::pipe::owner_sid);
     let mut out = std::io::stdout();
     run(
         &cmd,

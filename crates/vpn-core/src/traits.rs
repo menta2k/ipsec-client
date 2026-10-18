@@ -109,6 +109,11 @@ pub trait JournalStore: Send + Sync {
 pub trait SecretProtector: Send + Sync {
     fn protect(&self, plain: &[u8]) -> io::Result<Vec<u8>>;
     fn unprotect(&self, blob: &[u8]) -> io::Result<Zeroizing<Vec<u8>>>;
+    /// True if `blob` opens but was sealed in an older, weaker form and
+    /// should be re-sealed with [`protect`](Self::protect).
+    fn needs_reseal(&self, _blob: &[u8]) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

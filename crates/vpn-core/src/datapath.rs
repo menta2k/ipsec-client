@@ -95,6 +95,11 @@ struct IkeShared {
     next_msg_id: u32,
     /// Outstanding DPD probe: (message id, encoded request, first sent, last sent).
     pending_dpd: Option<(u32, Vec<u8>, Instant, Instant)>,
+    /// Responder side of the IKE SA (RFC 7296 §2.2): the message id of the
+    /// last gateway request we processed and our response to it, re-sent
+    /// verbatim if the gateway retransmits that request. `None` until the
+    /// gateway's first request, which carries message id 0.
+    last_peer_request: Option<(u32, Option<Vec<u8>>)>,
 }
 
 pub struct DataPath {
@@ -135,6 +140,7 @@ impl DataPath {
             ike,
             next_msg_id,
             pending_dpd: None,
+            last_peer_request: None,
         }));
         let (exit_tx, exit_rx) = channel();
         let epoch = Instant::now();
@@ -330,6 +336,13 @@ fn spawn_inbound(
 
 /// Handle an inbound IKE message on the established SA. Returns an exit
 /// reason when the gateway deleted the SA.
+///
+/// An authentic message is not necessarily a fresh one: an on-path attacker
+/// can replay anything the gateway sent earlier. So only messages that cannot
+/// be replays refresh `last_rx`: the response to the outstanding DPD probe,
+/// and a gateway request carrying the next expected message id (RFC 7296
+/// §2.2, window of one). A retransmission of the previous request gets the
+/// cached response; anything else is dropped.
 fn handle_ike(
     msg: &[u8],
     ike: &Mutex<IkeShared>,
@@ -345,11 +358,29 @@ fn handle_ike(
             return None;
         }
     };
-    last_rx.store(now_ms(epoch), Ordering::Relaxed);
     if inbound.is_response() {
         if matches!(&st.pending_dpd, Some((id, ..)) if *id == inbound.message_id) {
+            last_rx.store(now_ms(epoch), Ordering::Relaxed);
             debug!(target: TARGET, "DPD answered");
             st.pending_dpd = None;
+        }
+        return None;
+    }
+    let expected = match &st.last_peer_request {
+        None => Some(0),
+        Some((id, _)) => id.checked_add(1),
+    };
+    if expected != Some(inbound.message_id) {
+        match &st.last_peer_request {
+            Some((id, resp)) if *id == inbound.message_id => {
+                if let Some(resp) = resp {
+                    send_ike(link, resp);
+                }
+                debug!(target: TARGET, id, "re-sent response to retransmitted gateway request");
+            }
+            _ => {
+                debug!(target: TARGET, id = inbound.message_id, "dropped gateway request outside the message-id window");
+            }
         }
         return None;
     }
@@ -357,15 +388,21 @@ fn handle_ike(
         debug!(target: TARGET, exchange = inbound.exchange, "ignored gateway request (no rekey support)");
         return None;
     }
+    last_rx.store(now_ms(epoch), Ordering::Relaxed);
     let deleted = inbound
         .payloads
         .iter()
         .filter(|p| p.payload_type == PayloadType::Delete as u8)
         .filter_map(|p| DeletePayload::decode(&p.data).ok())
         .any(|d| d.protocol_id == ProtocolId::Ike as u8 || d.protocol_id == ProtocolId::Esp as u8);
-    if let Ok(resp) = st.ike.build_informational_response(inbound.message_id, &[]) {
-        send_ike(link, &resp);
+    let resp = st
+        .ike
+        .build_informational_response(inbound.message_id, &[])
+        .ok();
+    if let Some(resp) = &resp {
+        send_ike(link, resp);
     }
+    st.last_peer_request = Some((inbound.message_id, resp));
     if deleted {
         info!(target: TARGET, "gateway deleted the SA");
         return Some(ExitReason::DeletedByGateway);
@@ -429,4 +466,243 @@ fn spawn_timer(
             }
         })
         .expect("spawn timer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ike::constants::{dh, encr, integ, prf, IdType, TransformType, FLAG_RESPONSE};
+    use ike::crypto::{KeyLengths, Prf};
+    use ike::message::{Message, RawPayload};
+    use ike::payloads::{IdPayload, KePayload, Proposal, SaPayload, Transform};
+    use ike::sa::InitiatorConfig;
+    use std::io;
+    use std::net::SocketAddr;
+    use zeroize::Zeroizing;
+
+    /// Records every datagram the data path sends.
+    #[derive(Default)]
+    struct RecLink(Mutex<Vec<Vec<u8>>>);
+
+    impl UdpLink for RecLink {
+        fn send(&self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn recv(&self, _buf: &mut [u8], _timeout: Duration) -> io::Result<usize> {
+            Err(io::ErrorKind::WouldBlock.into())
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(([127, 0, 0, 1], 4500).into())
+        }
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(([127, 0, 0, 1], 4500).into())
+        }
+    }
+
+    fn transform(transform_type: TransformType, transform_id: u16, key: Option<u16>) -> Transform {
+        Transform {
+            transform_type: transform_type as u8,
+            transform_id,
+            key_length: key,
+        }
+    }
+
+    /// An initiator holding IKE SA keys (as after IKE_SA_INIT).
+    fn keyed_initiator() -> Initiator {
+        let proposals = SaPayload {
+            proposals: vec![Proposal {
+                proposal_num: 1,
+                protocol_id: ProtocolId::Ike as u8,
+                spi: vec![],
+                transforms: vec![
+                    transform(TransformType::Encr, encr::AES_CBC, Some(256)),
+                    transform(TransformType::Prf, prf::HMAC_SHA2_256, None),
+                    transform(TransformType::Integ, integ::HMAC_SHA2_256_128, None),
+                    transform(TransformType::Dh, dh::CURVE25519, None),
+                ],
+            }],
+        };
+        let cfg = InitiatorConfig {
+            proposals: proposals.clone(),
+            dh_group: dh::CURVE25519,
+            prf: Prf::HmacSha256,
+            key_lengths: KeyLengths {
+                prf_key: 32,
+                integ_key: 32,
+                encr_key: 32,
+            },
+            idi: IdPayload {
+                id_type: IdType::Rfc822Addr as u8,
+                id_data: b"client@test".to_vec(),
+            },
+            psk: Zeroizing::new(b"psk".to_vec()),
+        };
+        let mut init = Initiator::new(cfg, [0x11; 8], vec![0xAA; 32]);
+        init.build_ike_sa_init(&[0x42; 32], &[]);
+        let raw = |t: PayloadType, data: Vec<u8>| RawPayload {
+            payload_type: t as u8,
+            critical: false,
+            data,
+        };
+        let reply = Message {
+            initiator_spi: [0x11; 8],
+            responder_spi: [0x22; 8],
+            exchange_type: ExchangeType::IkeSaInit as u8,
+            flags: FLAG_RESPONSE,
+            message_id: 0,
+            payloads: vec![
+                raw(PayloadType::Sa, proposals.encode()),
+                raw(
+                    PayloadType::Ke,
+                    KePayload {
+                        dh_group: dh::CURVE25519,
+                        key_exchange_data: vec![0x43; 32],
+                    }
+                    .encode(),
+                ),
+                raw(PayloadType::Nonce, vec![0xBB; 32]),
+            ],
+        }
+        .to_bytes();
+        init.process_ike_sa_init_reply(&reply, &[0x99; 32]).unwrap();
+        init
+    }
+
+    const STALE: u64 = u64::MAX;
+
+    struct Fixture {
+        ike: Mutex<IkeShared>,
+        link: RecLink,
+        last_rx: AtomicU64,
+        epoch: Instant,
+    }
+
+    impl Fixture {
+        fn new() -> Fixture {
+            Fixture {
+                ike: Mutex::new(IkeShared {
+                    ike: keyed_initiator(),
+                    next_msg_id: 5,
+                    pending_dpd: None,
+                    last_peer_request: None,
+                }),
+                link: RecLink::default(),
+                last_rx: AtomicU64::new(STALE),
+                epoch: Instant::now(),
+            }
+        }
+
+        /// An empty INFORMATIONAL message as the gateway would send it.
+        fn gateway_msg(&self, flags: u8, message_id: u32) -> Vec<u8> {
+            let st = self.ike.lock().unwrap();
+            let keys = st.ike.keys().unwrap();
+            ike::sk::encrypt_message(
+                st.ike.initiator_spi(),
+                st.ike.responder_spi().unwrap(),
+                ExchangeType::Informational as u8,
+                flags,
+                message_id,
+                0,
+                &[],
+                &st.ike.negotiated().unwrap().suite,
+                &keys.sk_er,
+                &keys.sk_ar,
+            )
+        }
+
+        /// True if `dgram` is our response to gateway request `message_id`.
+        fn is_response_to(&self, dgram: &[u8], message_id: u32) -> bool {
+            let st = self.ike.lock().unwrap();
+            let keys = st.ike.keys().unwrap();
+            let msg = &dgram[4..];
+            dgram[..4] == [0, 0, 0, 0]
+                && msg[19] & FLAG_RESPONSE != 0
+                && msg[20..24] == message_id.to_be_bytes()
+                && ike::sk::decrypt_message(
+                    msg,
+                    &st.ike.negotiated().unwrap().suite,
+                    &keys.sk_ei,
+                    &keys.sk_ai,
+                )
+                .is_ok()
+        }
+
+        /// Deliver `msg`; returns (refreshed liveness, datagrams sent back).
+        fn deliver(&self, msg: &[u8]) -> (bool, Vec<Vec<u8>>) {
+            self.last_rx.store(STALE, Ordering::Relaxed);
+            let exit = handle_ike(msg, &self.ike, &self.link, &self.last_rx, self.epoch);
+            assert_eq!(exit, None);
+            let sent = std::mem::take(&mut *self.link.0.lock().unwrap());
+            (self.last_rx.load(Ordering::Relaxed) != STALE, sent)
+        }
+    }
+
+    #[test]
+    fn gateway_requests_follow_the_message_id_window() {
+        let f = Fixture::new();
+        let req0 = f.gateway_msg(0, 0);
+
+        // The gateway's first request carries id 0: processed and answered.
+        let (fresh, sent) = f.deliver(&req0);
+        assert!(fresh);
+        assert_eq!(sent.len(), 1);
+        assert!(f.is_response_to(&sent[0], 0));
+        let resp0 = sent[0].clone();
+
+        // A retransmission (or replay) of it gets the very same response and
+        // is not proof of liveness.
+        let (fresh, sent) = f.deliver(&req0);
+        assert!(!fresh);
+        assert_eq!(sent, vec![resp0.clone()]);
+
+        // A request that skips ahead is outside the window.
+        let (fresh, sent) = f.deliver(&f.gateway_msg(0, 2));
+        assert!(!fresh);
+        assert!(sent.is_empty());
+
+        // The next expected id is processed.
+        let (fresh, sent) = f.deliver(&f.gateway_msg(0, 1));
+        assert!(fresh);
+        assert_eq!(sent.len(), 1);
+        assert!(f.is_response_to(&sent[0], 1));
+
+        // An older request is dropped silently.
+        let (fresh, sent) = f.deliver(&req0);
+        assert!(!fresh);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn first_gateway_request_must_have_id_zero() {
+        let f = Fixture::new();
+        let (fresh, sent) = f.deliver(&f.gateway_msg(0, 1));
+        assert!(!fresh);
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn only_the_answer_to_the_outstanding_probe_proves_liveness() {
+        let f = Fixture::new();
+        // A response to an earlier exchange (e.g. a replayed IKE_AUTH reply)
+        // while no probe is outstanding.
+        let (fresh, sent) = f.deliver(&f.gateway_msg(FLAG_RESPONSE, 1));
+        assert!(!fresh);
+        assert!(sent.is_empty());
+
+        let now = Instant::now();
+        f.ike.lock().unwrap().pending_dpd = Some((5, vec![], now, now));
+        let (fresh, _) = f.deliver(&f.gateway_msg(FLAG_RESPONSE, 4));
+        assert!(!fresh);
+        assert!(f.ike.lock().unwrap().pending_dpd.is_some());
+
+        let answer = f.gateway_msg(FLAG_RESPONSE, 5);
+        let (fresh, _) = f.deliver(&answer);
+        assert!(fresh);
+        assert!(f.ike.lock().unwrap().pending_dpd.is_none());
+
+        // Replaying that answer later proves nothing.
+        let (fresh, _) = f.deliver(&answer);
+        assert!(!fresh);
+    }
 }

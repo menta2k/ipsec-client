@@ -28,6 +28,15 @@ embed-resource = "3"
 # tray-icon on Linux runs on a GTK main loop (libappindicator).
 gtk = "0.18"
 
+[target.'cfg(windows)'.dependencies]
+# Owner check of the service's named pipe (src/pipe_owner.rs only); the same
+# version the service already uses.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
 [dev-dependencies]
 serde_json.workspace = true
 

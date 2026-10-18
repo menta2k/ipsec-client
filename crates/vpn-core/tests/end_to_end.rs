@@ -4,7 +4,6 @@
 
 use ipc_proto::*;
 use std::net::Ipv4Addr;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 use vpn_core::datapath::DataPathConfig;
@@ -37,7 +36,7 @@ struct Harness {
     tun: Arc<MockTunFactory>,
     net: Arc<MockNetConfig>,
     journal: Arc<MemJournal>,
-    events: Receiver<Event>,
+    events: vpn_core::events::Subscription,
     resp: MockResponder,
     profile_id: String,
     store: Arc<ProfileStore>,
@@ -275,6 +274,41 @@ fn gateway_auth_mismatch_aborts_before_credentials() {
 }
 
 #[test]
+fn eap_success_without_authenticator_response_is_rejected() {
+    let h = harness(
+        ResponderConfig {
+            skip_mschap_success: true,
+            ..Default::default()
+        },
+        |_| {},
+    );
+    h.connect(Some(PASSWORD));
+    assert_eq!(h.wait_error(), ErrorCode::GatewayAuthFailed);
+    assert!(h.mgr.session().is_none());
+    h.assert_clean();
+}
+
+#[test]
+fn eap_final_gateway_auth_is_mandatory() {
+    for rcfg in [
+        ResponderConfig {
+            omit_final_auth: true,
+            ..Default::default()
+        },
+        ResponderConfig {
+            final_auth_with_psk: true,
+            ..Default::default()
+        },
+    ] {
+        let h = harness(rcfg, |_| {});
+        h.connect(Some(PASSWORD));
+        assert_eq!(h.wait_error(), ErrorCode::GatewayAuthFailed);
+        assert!(h.mgr.session().is_none());
+        h.assert_clean();
+    }
+}
+
+#[test]
 fn eap_requires_password() {
     let h = harness(ResponderConfig::default(), |_| {});
     let err = h.mgr.connect(&h.profile_id, None, false).unwrap_err();
@@ -361,6 +395,37 @@ fn invalid_ke_switches_group_once() {
     h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
 }
 
+#[test]
+fn invalid_ke_never_downgrades_group() {
+    use ike::dh::DhGroup;
+    for (configured, requested) in [
+        (DhGroupSel::X25519, DhGroup::Modp1536),
+        (DhGroupSel::X25519, DhGroup::Modp2048),
+        (DhGroupSel::Modp2048, DhGroup::Modp1536),
+    ] {
+        let h = harness(
+            ResponderConfig {
+                require_group: Some(requested),
+                ..Default::default()
+            },
+            |e| {
+                e.dh_group = configured;
+            },
+        );
+        h.connect(Some(PASSWORD));
+        assert_eq!(
+            h.wait_error(),
+            ErrorCode::InvalidKe,
+            "{configured:?} -> {requested:?}"
+        );
+        let obs = h.resp.obs();
+        assert_eq!(obs.sa_init_count, 1, "{configured:?} -> {requested:?}");
+        assert!(!obs.established, "{configured:?} -> {requested:?}");
+        assert!(h.mgr.session().is_none());
+        h.assert_clean();
+    }
+}
+
 // ---------------------------------------------------------------- edge cases
 
 #[test]
@@ -403,6 +468,33 @@ fn gateway_lost_cleans_up() {
     );
     h.connect(Some(PASSWORD));
     h.wait_connected();
+    assert_eq!(h.wait_error(), ErrorCode::GatewayLost);
+    h.assert_clean();
+}
+
+#[test]
+fn replayed_gateway_request_does_not_hide_a_lost_gateway() {
+    let h = harness(
+        ResponderConfig {
+            silent_after_established: true,
+            ..Default::default()
+        },
+        |_| {},
+    );
+    h.connect(Some(PASSWORD));
+    h.wait_connected();
+    // One genuine gateway liveness check, then an on-path attacker drops
+    // everything and keeps replaying it well inside the DPD idle time.
+    let captured = h.resp.send_liveness_check(0).expect("gateway request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(h.mgr.state(), ConnectionState::Error { .. }) {
+        assert!(
+            Instant::now() < deadline,
+            "replayed gateway request kept a lost gateway alive"
+        );
+        h.resp.replay(&captured);
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert_eq!(h.wait_error(), ErrorCode::GatewayLost);
     h.assert_clean();
 }

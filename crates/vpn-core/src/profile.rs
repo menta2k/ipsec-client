@@ -103,6 +103,13 @@ fn err(field: &'static str, message: &str) -> FieldError {
     }
 }
 
+/// True if `s` contains a control character (CR, LF, tab, ...) or a Unicode
+/// line/paragraph separator.
+fn has_control_chars(s: &str) -> bool {
+    s.chars()
+        .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+}
+
 /// Validate an edit (uniqueness of the name is checked by the store).
 ///
 /// Rules (data-model.md):
@@ -111,10 +118,19 @@ fn err(field: &'static str, message: &str) -> FieldError {
 /// * "port 1–65535 default 500"
 /// * "local_id 1–255; ipv4 must parse when id_type=ipv4"
 /// * "username required 1–256 when auth=eap"
+///
+/// In addition, the name must not contain control characters or line breaks:
+/// it is written to the service log, where they could forge log lines.
 pub fn validate(e: &ProfileEdit) -> Result<(), FieldError> {
     let name = e.name.trim();
     if name.is_empty() || name.chars().count() > 64 {
         return Err(err("name", "must be 1–64 characters"));
+    }
+    if has_control_chars(name) {
+        return Err(err(
+            "name",
+            "must not contain control characters or line breaks",
+        ));
     }
     let gw = e.gateway.trim();
     if gw.is_empty() || gw.len() > 253 {
@@ -210,6 +226,55 @@ mod tests {
             mutate(&mut e);
             assert_eq!(validate(&e).unwrap_err().field, field);
         }
+    }
+
+    #[test]
+    fn rejects_control_characters_in_name() {
+        for bad in [
+            "Office\nFAKE log line",
+            "Office\r\nFAKE",
+            "Off\rice",
+            "Off\tice",
+            "Off\u{0}ice",
+            "Off\u{1b}[31mice",
+            "Off\u{85}ice",
+            "Off\u{2028}ice",
+            "Off\u{2029}ice",
+        ] {
+            let mut e = ok_edit();
+            e.name = bad.into();
+            assert_eq!(validate(&e).unwrap_err().field, "name", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_unicode_names_and_still_trims() {
+        for good in ["Büro Zürich", "東京オフィス", "Office – HQ", "VPN (home)"] {
+            let mut e = ok_edit();
+            e.name = good.into();
+            assert_eq!(validate(&e), Ok(()), "{good:?}");
+        }
+        // Surrounding whitespace, line breaks included, is still trimmed.
+        let mut e = ok_edit();
+        e.name = "  Office \r\n".into();
+        assert_eq!(validate(&e), Ok(()));
+        let mut p = Profile {
+            id: "p".into(),
+            name: String::new(),
+            gateway: String::new(),
+            port: 500,
+            local_id: String::new(),
+            id_type: e.id_type,
+            dh_group: e.dh_group,
+            auth: e.auth,
+            username: String::new(),
+            auto_reconnect: false,
+            psk_blob: None,
+            password_blob: None,
+            sign_in: false,
+        };
+        p.apply_fields(&e);
+        assert_eq!(p.name, "Office");
     }
 
     #[test]

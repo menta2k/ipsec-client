@@ -226,8 +226,12 @@ impl EspOutbound {
                 pt.push(pad as u8);
                 pt.push(next_header);
 
-                let mut iv = [0u8; 8];
-                crate::rng::fill(&mut iv);
+                // RFC 4106 §3.1: the explicit IV must be unique under the key, not
+                // random. Use the per-SA sequence number zero-extended to 64 bits
+                // (as strongSwan iv_gen_seq / Linux seqiv do): it strictly
+                // increases and encryption stops at SeqExhausted, so the GCM
+                // nonce (salt | IV) never repeats for this SA's key.
+                let iv = u64::from(seq).to_be_bytes();
                 let mut nonce = [0u8; 12];
                 nonce[..4].copy_from_slice(salt);
                 nonce[4..].copy_from_slice(&iv);
@@ -451,6 +455,36 @@ mod tests {
         let (_b_out, mut b_in) = b.split();
         let pkt = a_out.encrypt(4, b"hello world").unwrap();
         assert_eq!(b_in.decrypt(&pkt).unwrap().1, b"hello world");
+    }
+
+    #[test]
+    fn gcm_explicit_iv_is_sequence_number() {
+        let (mut a, mut b) = pair(EspCipher::Aes256Gcm16);
+        for expected in 1u32..=5 {
+            let pkt = a.encrypt(4, b"payload").unwrap();
+            let seq = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+            assert_eq!(seq, expected);
+            assert_eq!(&pkt[8..16], &u64::from(seq).to_be_bytes());
+            assert_eq!(b.decrypt(&pkt).unwrap().1, b"payload");
+        }
+    }
+
+    #[test]
+    fn gcm_iv_never_repeats_and_stops_at_seq_exhaustion() {
+        let (mut a, mut b) = pair(EspCipher::Aes256Gcm16);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let pkt = a.encrypt(4, b"x").unwrap();
+            assert!(seen.insert(pkt[8..16].to_vec()), "GCM explicit IV reused");
+        }
+        // The last usable sequence number yields the last IV; the SA then
+        // refuses to encrypt rather than wrapping and reusing a nonce.
+        a.out.seq = u32::MAX - 1;
+        let last = a.encrypt(4, b"x").unwrap();
+        assert_eq!(&last[8..16], &u64::from(u32::MAX).to_be_bytes());
+        assert!(seen.insert(last[8..16].to_vec()));
+        assert!(b.decrypt(&last).is_ok());
+        assert_eq!(a.encrypt(4, b"x"), Err(EspError::SeqExhausted));
     }
 
     #[test]
