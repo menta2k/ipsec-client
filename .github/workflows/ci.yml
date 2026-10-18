@@ -1,9 +1,12 @@
 # Continuous integration (002 T038; FR-028–FR-030).
-#   windows:   the gates on Windows (service, GUI, PLAP crate).
+#   windows:   the gates on Windows (service, GUI, PLAP crate), then the MSI.
 #   linux:     the gates on Linux incl. the GUI, the root-only TUN test, and
 #              the .deb/.rpm packages.
 #   linux-e2e: the real client against a real strongSwan gateway in network
 #              namespaces (tests/linux-e2e/run.sh).
+#   macos:     the universal app in a .dmg (GUI + service; the macOS service
+#              back-end is feature 004, so the app drives `run --mock` only).
+# Each packaging job uploads its installer as a build artifact.
 name: CI
 
 on:
@@ -31,6 +34,24 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      - name: Wintun
+        # The signed driver DLL is not in the repository; pin the release.
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash
+          if ($hash -ne '07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51') {
+            throw "wintun.zip checksum mismatch: $hash"
+          }
+          Expand-Archive wintun.zip -DestinationPath $env:RUNNER_TEMP
+      - name: Build MSI
+        shell: pwsh
+        run: ./installer/build.ps1 -Wintun "$env:RUNNER_TEMP/wintun/bin/amd64/wintun.dll"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi
+          path: target/installer/*.msi
+          if-no-files-found: error
 
   linux:
     runs-on: ubuntu-24.04
@@ -96,3 +117,19 @@ jobs:
           sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
                DRIVER_BIN="${{ steps.build.outputs.driver }}" \
                tests/linux-e2e/run.sh
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build DMG
+        run: sh packaging/macos/build-dmg.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: target/macos/*.dmg
+          if-no-files-found: error

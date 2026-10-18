@@ -6,9 +6,9 @@
   .\installer\build.ps1 -Wintun C:\Downloads\wintun\bin\amd64\wintun.dll
 
 .NOTES
-  Needs the .NET SDK (WiX 5 is restored as a repo-local dotnet tool) and the
-  amd64 wintun.dll from https://www.wintun.net. Without -Wintun, the script
-  looks in target\release, then target\debug.
+  Needs the .NET SDK (WiX 5 is installed as a repo-local dotnet tool on first
+  use) and the amd64 wintun.dll from https://www.wintun.net. Without -Wintun,
+  the script looks in target\release, then target\debug.
   Output: target\installer\IpsecClient-<version>-x64.msi
 #>
 param(
@@ -38,6 +38,14 @@ try {
         throw 'wintun.dll not found: download it from https://www.wintun.net and pass -Wintun <path to bin\amd64\wintun.dll>'
     }
 
+    # The tool manifest (.config/dotnet-tools.json) is not in the repository:
+    # create it on first use so WiX stays pinned to the version below.
+    if (-not (Test-Path '.config\dotnet-tools.json')) {
+        dotnet new tool-manifest | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'dotnet new tool-manifest failed' }
+        dotnet tool install wix --version 5.0.2 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'dotnet tool install wix failed' }
+    }
     dotnet tool restore | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'dotnet tool restore failed' }
     dotnet tool run wix extension add -g WixToolset.Util.wixext/5.0.2 | Out-Null
