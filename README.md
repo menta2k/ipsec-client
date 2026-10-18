@@ -111,9 +111,20 @@ CI (`.github/workflows/ci.yml`) runs these jobs:
     daemon) and a `.dmg` holding it. CI installs, upgrades and uninstalls it on the
     runner (`tests/macos-e2e/package.sh`).
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds the macOS installer, signs
-and notarizes it when the Apple Developer ID secrets are configured (see
-`packaging/macos/sign-and-notarize.sh`), and attaches it to a draft release.
+### Releases
+
+Raise `version` in the workspace `Cargo.toml`, then push a matching tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` checks that the tag matches the version, tests and builds the
+MSI, the `.deb` and `.rpm`, and the macOS `.pkg` and `.dmg`, then publishes a GitHub release
+with all of them, a `SHA256SUMS` file and generated notes. A tag with a hyphen (`v0.2.0-rc1`)
+makes a prerelease. The macOS package is signed and notarized when the Apple Developer ID
+secrets are configured (see `packaging/macos/sign-and-notarize.sh`); the release notes say
+which installers are unsigned.
 
 ## Run
 
