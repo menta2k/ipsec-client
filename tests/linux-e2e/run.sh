@@ -8,7 +8,9 @@
 #            ipsec-service run                       charon + dummy0 10.99.1.1/24
 #
 # Needs: iproute2, iputils-ping, strongswan-swanctl, charon-systemd,
-# libcharon-extra-plugins, libstrongswan-extra-plugins.
+# libcharon-extra-plugins, libstrongswan-extra-plugins,
+# libstrongswan-standard-plugins (openssl: AES-GCM) and
+# libcharon-extauth-plugins (eap-mschapv2).
 #
 # Binaries: set SERVICE_BIN and DRIVER_BIN to prebuilt ones (CI does), or
 # leave them unset to build with cargo as the user who invoked sudo.

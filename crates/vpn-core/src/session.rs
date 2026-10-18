@@ -101,6 +101,7 @@ pub struct Established {
     pub link: Arc<dyn UdpLink>,
     /// Current remote endpoint (gateway NAT-T port).
     pub gateway: SocketAddrV4,
+    /// The SA runs NAT-T: a NAT was detected or encapsulation was forced.
     pub nat_detected: bool,
     /// Next message id for initiator requests on the IKE SA.
     pub next_msg_id: u32,
@@ -436,7 +437,9 @@ pub fn establish(
             });
         let neg = init.negotiated().expect("negotiated after SA_INIT");
         info!(target: TARGET, suite = %proposals::describe_ike(&neg, dh), nat, "<= IKE_SA_INIT");
-        break ((init, dh), nat);
+        // Forced encapsulation makes the gateway see us as NATed, so the SA
+        // runs NAT-T whether or not the path really has a NAT.
+        break ((init, dh), nat || cfg.force_encap);
     };
     let (init, dh) = init;
     on_phase(Phase::Authenticating);
