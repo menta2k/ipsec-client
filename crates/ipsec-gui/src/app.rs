@@ -65,6 +65,8 @@ pub struct App {
     quitting: bool,
     /// State before the latest transition (for notifications).
     was_connected: bool,
+    #[cfg(target_os = "macos")]
+    login_item: crate::macos::LoginItem,
 }
 
 impl App {
@@ -78,6 +80,8 @@ impl App {
                 None
             }
         };
+        #[cfg(target_os = "macos")]
+        crate::macos::init_notifications();
         if start_hidden && tray.is_some() {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -98,6 +102,8 @@ impl App {
             tray,
             quitting: false,
             was_connected: false,
+            #[cfg(target_os = "macos")]
+            login_item: crate::macos::login_item(),
         }
     }
 
@@ -348,9 +354,11 @@ fn notify(summary: &str, body: &str) {
     });
 }
 
-/// macOS: native notifications arrive with 004 T049.
+/// macOS: the system notification centre (004 T049).
 #[cfg(target_os = "macos")]
-fn notify(_summary: &str, _body: &str) {}
+fn notify(summary: &str, body: &str) {
+    crate::macos::notify(summary, body);
+}
 
 /// What closing the window does (002 FR-022).
 #[derive(Debug, PartialEq, Eq)]
@@ -405,6 +413,40 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// macOS: "Start at login", off by default (004 T050). Errors from the
+    /// system are shown as the notice.
+    #[cfg(target_os = "macos")]
+    fn login_item_switch(&mut self, ui: &mut egui::Ui) {
+        use crate::macos::{login_item, open_login_items_settings, set_login_item, LoginItem};
+        ui.separator();
+        if self.login_item == LoginItem::Unavailable {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Start at login"))
+                .on_disabled_hover_text("Available when run from IPsec Client.app");
+            return;
+        }
+        let mut on = self.login_item != LoginItem::Disabled;
+        if ui.checkbox(&mut on, "Start at login").changed() {
+            if let Err(e) = set_login_item(on) {
+                self.notice = Some(format!("Start at login: {e}"));
+            }
+            self.login_item = login_item();
+        }
+        if self.login_item == LoginItem::NeedsApproval
+            && ui
+                .small_button("Allow in System Settings…")
+                .on_hover_text("General > Login Items")
+                .clicked()
+        {
+            open_login_items_settings();
+        }
+    }
+
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(4.0);
@@ -412,6 +454,8 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Profiles, "Profiles");
                 ui.selectable_value(&mut self.tab, Tab::Log, "Log");
+                #[cfg(target_os = "macos")]
+                self.login_item_switch(ui);
                 // Without a tray, closing only minimizes; this is the way out.
                 if self.tray.is_none() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

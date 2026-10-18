@@ -12,7 +12,19 @@ logs=/Library/Logs/IpsecClient
 sock=/var/run/ipsec-client/ipsec-client.sock
 secret="pkg-check-secret-$$-$(date +%s)"
 
-fail() { echo "FAIL: $*" >&2; sudo cat "$logs/service.out" 2>/dev/null | tail -n 50 >&2 || true; exit 1; }
+fail() {
+    echo "FAIL: $*" >&2
+    tail_log="$(sudo tail -n 30 "$logs/service.out" 2>/dev/null || true)"
+    echo "$tail_log" >&2
+    # An annotation is readable without signing in to GitHub.
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        msg="$(printf '%s
+%s' "$*" "$tail_log" | sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/
+/%0A/g')"
+        echo "::error title=macOS package::$msg"
+    fi
+    exit 1
+}
 step() { echo "==> $*"; }
 install_pkg() { sudo installer -pkg "$pkg" -target / >/dev/null || fail "installer"; }
 wait_for() { # <description> <command...>

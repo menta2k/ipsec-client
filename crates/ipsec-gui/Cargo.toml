@@ -31,6 +31,7 @@ notify-rust = "4"
 # Rust bindings to system frameworks (004 research R9): notifications and the
 # login item. Same objc2 generation as winit and tray-icon.
 objc2 = "0.6"
+block2 = "0.6"
 objc2-foundation = "0.3"
 objc2-user-notifications = "0.3"
 objc2-service-management = "0.3"

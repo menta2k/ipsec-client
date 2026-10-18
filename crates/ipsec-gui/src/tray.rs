@@ -58,7 +58,24 @@ fn look(state: &ConnectionState) -> Look {
     }
 }
 
+/// macOS (004 T047): a monochrome template glyph per state, recoloured by
+/// the system to suit a light or dark menu bar.
+#[cfg(target_os = "macos")]
+fn draw_icon(l: Look) -> Icon {
+    use crate::icon::{render_template, Glyph, TEMPLATE_SIZES};
+    let glyph = match l {
+        Look::Off => Glyph::Outline,
+        Look::Busy => Glyph::Busy,
+        Look::On => Glyph::Filled,
+        Look::Error => Glyph::Struck,
+    };
+    // The 2x image; tray-icon scales it to the menu-bar height.
+    let n = TEMPLATE_SIZES[1];
+    Icon::from_rgba(render_template(n, glyph), n, n).expect("valid icon")
+}
+
 /// The application shield, tinted by state.
+#[cfg(not(target_os = "macos"))]
 fn draw_icon(l: Look) -> Icon {
     const N: u32 = 32;
     let fill = match l {
@@ -107,12 +124,14 @@ struct TrayCore {
 impl TrayCore {
     fn new(state: &ConnectionState, profiles: &[ProfileView]) -> Result<Self, String> {
         let l = look(state);
-        let icon = TrayIconBuilder::new()
+        let builder = TrayIconBuilder::new()
             .with_menu(Box::new(build_menu(state, profiles)))
-            .with_icon(draw_icon(l))
-            .with_tooltip(tooltip(state))
-            .build()
-            .map_err(|e| e.to_string())?;
+            .with_tooltip(tooltip(state));
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_icon_templated(draw_icon(l));
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_icon(draw_icon(l));
+        let icon = builder.build().map_err(|e| e.to_string())?;
         Ok(TrayCore {
             icon,
             look: Some(l),
@@ -122,6 +141,9 @@ impl TrayCore {
     fn update(&mut self, state: &ConnectionState, profiles: &[ProfileView]) {
         let l = look(state);
         if self.look != Some(l) {
+            #[cfg(target_os = "macos")]
+            let _ = self.icon.set_icon_templated(Some(draw_icon(l)));
+            #[cfg(not(target_os = "macos"))]
             let _ = self.icon.set_icon(Some(draw_icon(l)));
             self.look = Some(l);
         }
