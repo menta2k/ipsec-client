@@ -31,6 +31,10 @@ pub enum ServiceLink {
 pub const UNAUTHORIZED_TEXT: &str = if cfg!(target_os = "linux") {
     "You are not allowed to control the VPN. Ask an administrator to add you to the \
      'ipsec-client' group, then log in again."
+} else if cfg!(target_os = "macos") {
+    "You are not allowed to control the VPN. Ask an administrator to add you to the VPN \
+     group (shown by `ipsec-service access-group`), or to choose a group you belong to \
+     with `sudo ipsec-service access-group <group>`."
 } else {
     "You are not allowed to control the VPN on this computer. Ask an administrator for access."
 };

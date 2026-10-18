@@ -324,10 +324,7 @@ fn real_parts(
     ring: &LogBuffer,
 ) -> io::Result<Parts> {
     use crate::macos::{
-        netconfig::MacNetConfig,
-        socket::{MacSocketListener, ADMIN_GID},
-        utun::MacTunFactory,
-        SysIfNames,
+        group, netconfig::MacNetConfig, socket::MacSocketListener, utun::MacTunFactory, SysIfNames,
     };
     use crate::unix_cmd::SystemRunner;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -385,10 +382,17 @@ fn real_parts(
         config: EngineConfig::default(),
     });
 
-    // The configurable VPN group arrives with 004 US3; `admin` until then.
+    // Only members of the access group may open the socket (004 US3).
+    let configured = vpn_core::SettingsStore::open(dir.join("settings.json"))
+        .0
+        .access_group();
+    let access = group::resolve_or_admin(configured.as_deref(), &SystemRunner);
+    if let Some(w) = &access.warning {
+        tracing::error!(target: "host", "{w}");
+    }
     let socket = paths::socket_path();
-    let listener = Arc::new(MacSocketListener::bind(socket.clone(), ADMIN_GID)?);
-    info!(target: "host", endpoint = %socket.display(), "listening");
+    let listener = Arc::new(MacSocketListener::bind(socket.clone(), access.gid)?);
+    info!(target: "host", endpoint = %socket.display(), group = %access.name, gid = access.gid, "listening");
     Ok((mgr, store, listener, guard))
 }
 

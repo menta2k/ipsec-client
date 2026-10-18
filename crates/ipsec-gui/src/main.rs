@@ -68,6 +68,13 @@ fn main() -> eframe::Result {
                 width: 64,
                 height: 64,
             }),
+        // macOS (004 T048): a menu-bar app, with no Dock icon even when run
+        // outside the app bundle.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     eframe::run_native(

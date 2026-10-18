@@ -1,12 +1,13 @@
 //! macOS back-end (feature 004): the counterparts of `src/linux/` and
 //! `src/windows/`.
 //!
-//! `netconfig`, `group` and `launchd` only build commands and parse their
+//! `netconfig`, `group`, `launchd` and `syslog` only build commands and parse their
 //! output, so they compile (and are unit-tested) on every OS. The modules that
 //! make syscalls are macOS-only; `unsafe` is confined to `sys`.
 
 // Off macOS only the unit tests use the portable modules.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod group;
 pub mod launchd;
 pub mod netconfig;
 #[cfg(target_os = "macos")]

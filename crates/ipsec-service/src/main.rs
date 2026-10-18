@@ -31,7 +31,9 @@ commands:
   service        entry point used by the Service Control Manager
   plc …          Pre-Login Connect: sign-in profiles and sign-out policy
   profile import <file.json> [--sign-in]
-                 create or update profiles (administrator)";
+                 create or update profiles (administrator)
+  access-group [<name>]
+                 macOS: show or set the group allowed to control the VPN";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +50,8 @@ fn main() {
         ["start"] => manage("start", Manage::Start),
         ["stop"] => manage("stop", Manage::Stop),
         ["cleanup"] => cleanup(),
+        ["access-group"] => access_group(None),
+        ["access-group", name] => access_group(Some(name)),
         ["service"] => service_entry(),
         ["plc", ..] | ["profile", ..] => {
             plc_cli::main(&args.iter().map(String::as_str).collect::<Vec<_>>())
@@ -76,10 +80,9 @@ fn run_console(mode: Mode) -> i32 {
             eprintln!("error: `run` needs root (sudo); use `run --mock` for development");
             return 5;
         }
-        if macos::launchd::is_loaded(&unix_cmd::SystemRunner) {
-            eprintln!(
-                "error: the service is running under launchd; `sudo ipsec-service stop` first"
-            );
+        let running = macos::launchd::is_running(&unix_cmd::SystemRunner);
+        if let Err(e) = macos::launchd::refuse_if_running("run", running) {
+            eprintln!("error: {e}");
             return 5;
         }
     }
@@ -297,8 +300,9 @@ fn cleanup() -> i32 {
         eprintln!("cleanup: access denied (run with sudo)");
         return 5;
     }
-    if macos::launchd::is_loaded(&unix_cmd::SystemRunner) {
-        eprintln!("cleanup: the service is running under launchd; `sudo ipsec-service stop` first");
+    let running = macos::launchd::is_running(&unix_cmd::SystemRunner);
+    if let Err(e) = macos::launchd::refuse_if_running("cleanup", running) {
+        eprintln!("{e}");
         return 5;
     }
     let journal = vpn_core::traits::FileJournal {
@@ -308,6 +312,95 @@ fn cleanup() -> i32 {
     vpn_core::manager::recover(&macos::utun::MacTunFactory, &net, &journal);
     println!("cleanup: ok");
     0
+}
+
+/// macOS: show or change the group whose members may control the VPN
+/// (004 contracts/service-cli-macos.md).
+#[cfg(target_os = "macos")]
+fn access_group(name: Option<&str>) -> i32 {
+    use macos::group;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let runner = unix_cmd::SystemRunner;
+    let dir = paths::data_dir(false);
+    let Some(name) = name else {
+        if macos::sys::is_root() {
+            let configured = vpn_core::SettingsStore::open(dir.join("settings.json"))
+                .0
+                .access_group();
+            let r = group::resolve_or_admin(configured.as_deref(), &runner);
+            println!("{} (gid {})", r.name, r.gid);
+            if let Some(w) = r.warning {
+                eprintln!("warning: {w}");
+            }
+            return 0;
+        }
+        // Without root the data directory is closed; the socket directory
+        // shows the group the running service applied.
+        let sock = paths::socket_path();
+        let sock_dir = sock.parent().unwrap_or(std::path::Path::new("/"));
+        return match std::fs::metadata(sock_dir) {
+            Ok(m) => {
+                println!(
+                    "gid {} (from {}; run with sudo for the configured name)",
+                    m.gid(),
+                    sock_dir.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("access-group: the service is not running ({e}); run with sudo");
+                1
+            }
+        };
+    };
+    if !macos::sys::is_root() {
+        eprintln!("access-group: access denied (run with sudo)");
+        return 5;
+    }
+    if !group::valid_name(name) {
+        eprintln!(
+            "access-group: '{name}' is not a valid group name (1-32 characters: letters, digits, _ . -)"
+        );
+        return 2;
+    }
+    let stored = if name == group::DEFAULT_GROUP {
+        None
+    } else if group::lookup(name, &runner).is_some() {
+        Some(name.to_string())
+    } else {
+        eprintln!("access-group: group '{name}' does not exist");
+        return 1;
+    };
+    if let Err(e) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+    {
+        eprintln!("access-group: cannot create {}: {e}", dir.display());
+        return 1;
+    }
+    let (settings, problem) = vpn_core::SettingsStore::open(dir.join("settings.json"));
+    if let Some(e) = problem {
+        // Saving now would replace the other settings with defaults.
+        eprintln!("access-group: {e}; fix or remove the file first");
+        return 1;
+    }
+    if let Err(e) = settings.set_access_group(stored) {
+        eprintln!("access-group: cannot save the setting: {e}");
+        return 1;
+    }
+    if let Err(e) = macos::launchd::restart(&runner) {
+        eprintln!("access-group: saved, but {}", e.message);
+        return e.code;
+    }
+    println!("access-group: {name}");
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn access_group(_name: Option<&str>) -> i32 {
+    eprintln!("access-group: available on macOS only");
+    2
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]

@@ -15,9 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
-/// Gid of the macOS `admin` group, the default VPN group (004 data-model.md).
-pub const ADMIN_GID: u32 = 80;
-
 pub struct MacSocketListener {
     listener: UnixListener,
     path: PathBuf,
@@ -113,5 +110,18 @@ mod tests {
         assert!(!dir_is_trusted(501, 0o750));
         assert!(!dir_is_trusted(0, 0o770));
         assert!(!dir_is_trusted(0, 0o757));
+    }
+
+    #[test]
+    fn peer_credentials_name_this_process() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let (uid, _gid, pid) = sys::peer_cred(a.as_raw_fd()).unwrap();
+        assert_eq!(pid, std::process::id() as i32);
+        // The owner of a file this process creates is its effective uid.
+        let probe = std::env::temp_dir().join(format!("ipsec-peercred-{}", std::process::id()));
+        std::fs::write(&probe, b"").unwrap();
+        let me = std::fs::metadata(&probe).unwrap().uid();
+        let _ = std::fs::remove_file(&probe);
+        assert_eq!(uid, me);
     }
 }

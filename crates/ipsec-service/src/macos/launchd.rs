@@ -84,6 +84,54 @@ pub fn is_loaded(runner: &dyn CommandRunner) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `launchctl print` output shows the daemon running (it stays
+/// loaded but not running after `stop`).
+pub fn parse_running(print_out: &str) -> bool {
+    print_out.lines().any(|l| l.trim() == "state = running")
+}
+
+/// True if the daemon is loaded and its process is running.
+pub fn is_running(runner: &dyn CommandRunner) -> bool {
+    runner
+        .run(&["launchctl", "print", &target()])
+        .map(|o| o.status_ok && parse_running(&o.stdout))
+        .unwrap_or(false)
+}
+
+/// `run` and `cleanup` own the tunnel and the journal, so they refuse while
+/// the daemon runs (004 contracts/service-cli-macos.md, exit 5).
+pub fn refuse_if_running(what: &str, running: bool) -> Result<(), String> {
+    if running {
+        Err(format!(
+            "{what}: the service is running under launchd; `sudo ipsec-service stop` first"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Restart the daemon if it is loaded (`kickstart -k`), so it picks up new
+/// settings; nothing to do otherwise.
+pub fn restart(runner: &dyn CommandRunner) -> Result<(), VerbError> {
+    if !is_loaded(runner) {
+        return Ok(());
+    }
+    let out = runner
+        .run(&["launchctl", "kickstart", "-k", &target()])
+        .map_err(|e| VerbError {
+            code: 1,
+            message: format!("cannot run launchctl: {e}"),
+        })?;
+    if out.status_ok {
+        return Ok(());
+    }
+    let msg = format!("{} {}", out.stderr.trim(), out.stdout.trim());
+    Err(VerbError {
+        code: if denied(&msg) { 5 } else { 1 },
+        message: format!("restarting the service failed: {}", msg.trim()),
+    })
+}
+
 fn denied(msg: &str) -> bool {
     [
         "Operation not permitted",
@@ -141,7 +189,7 @@ pub fn run(verb: Verb, runner: &dyn CommandRunner) -> Result<(), VerbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unix_cmd::fake::{fail, FakeRunner};
+    use crate::unix_cmd::fake::{fail, ok, FakeRunner};
 
     #[test]
     fn plist_has_the_contract_keys() {
@@ -222,6 +270,57 @@ mod tests {
         let r = FakeRunner::new();
         r.on("launchctl kickstart", fail("Could not find service"));
         assert_eq!(run(Verb::Start, &r).unwrap_err().code, 1);
+    }
+
+    #[test]
+    fn running_is_read_from_print() {
+        let running = "system/net.ipsec-client.service = {
+	active count = 1
+	state = running
+	pid = 412
+}";
+        let stopped = "system/net.ipsec-client.service = {
+	state = not running
+}";
+        assert!(parse_running(running));
+        assert!(!parse_running(stopped));
+        let r = FakeRunner::new();
+        r.on("launchctl print", ok(running));
+        assert!(is_running(&r));
+        let r = FakeRunner::new();
+        r.on("launchctl print", ok(stopped));
+        assert!(!is_running(&r), "stopped but still loaded");
+        let r = FakeRunner::new();
+        r.on("launchctl print", fail("Could not find service"));
+        assert!(!is_running(&r));
+    }
+
+    #[test]
+    fn run_and_cleanup_refuse_only_while_running() {
+        assert_eq!(refuse_if_running("run", false), Ok(()));
+        let e = refuse_if_running("cleanup", true).unwrap_err();
+        assert!(e.starts_with("cleanup: "), "{e}");
+        assert!(e.contains("ipsec-service stop"), "{e}");
+    }
+
+    #[test]
+    fn restart_kicks_only_a_loaded_daemon() {
+        let r = FakeRunner::new();
+        r.on("launchctl print", fail("Could not find service"));
+        assert_eq!(restart(&r), Ok(()));
+        assert!(!r.calls().iter().any(|c| c.contains("kickstart")));
+        let r = FakeRunner::new();
+        assert_eq!(restart(&r), Ok(()));
+        assert_eq!(
+            r.calls().last().unwrap(),
+            "launchctl kickstart -k system/net.ipsec-client.service"
+        );
+        let r = FakeRunner::new();
+        r.on(
+            "launchctl kickstart",
+            fail("Not privileged to signal service."),
+        );
+        assert_eq!(restart(&r).unwrap_err().code, 5);
     }
 
     #[test]

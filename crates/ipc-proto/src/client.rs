@@ -170,6 +170,11 @@ enum Candidate {
     /// Connected as is: the Windows pipe, the system socket in the
     /// root-created runtime directory, or an explicit `IPSEC_CLIENT_SOCKET`.
     Fixed(PathBuf),
+    /// macOS: the root service's socket (or its override). Used only if the
+    /// socket and its directory belong to root and nobody else may write to
+    /// the directory (004 US3), so a socket planted by a user is never sent
+    /// a request.
+    Root(PathBuf),
     /// The per-user (mock) socket. It may sit in a shared temp directory, so
     /// it is only used if its listener runs as this user.
     PerUser(PathBuf),
@@ -178,9 +183,16 @@ enum Candidate {
 impl Candidate {
     fn into_path(self) -> PathBuf {
         match self {
-            Candidate::Fixed(p) | Candidate::PerUser(p) => p,
+            Candidate::Fixed(p) | Candidate::Root(p) | Candidate::PerUser(p) => p,
         }
     }
+}
+
+/// Whether a [`Candidate::Root`] socket may be used: socket and directory
+/// owned by root, and no group or other write bit on the directory.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn root_owned_ok(socket_uid: u32, dir_uid: u32, dir_mode: u32) -> bool {
+    socket_uid == 0 && dir_uid == 0 && dir_mode & 0o022 == 0
 }
 
 /// Linux and macOS: override, system socket, then the per-user (mock) socket.
@@ -198,11 +210,21 @@ fn candidates(
             } else {
                 MACOS_SYSTEM_SOCKET
             };
+            // Linux: the service runs as its own unprivileged user and the
+            // socket sits in a directory systemd creates; macOS: the service
+            // is root, which the client checks.
+            let fixed = |p: PathBuf| {
+                if os == Os::Mac {
+                    Candidate::Root(p)
+                } else {
+                    Candidate::Fixed(p)
+                }
+            };
             let mut v: Vec<Candidate> = env(SOCKET_ENV)
-                .map(|p| Candidate::Fixed(PathBuf::from(p)))
+                .map(|p| fixed(PathBuf::from(p)))
                 .into_iter()
                 .collect();
-            v.push(Candidate::Fixed(PathBuf::from(system)));
+            v.push(fixed(PathBuf::from(system)));
             v.push(Candidate::PerUser(user_socket(&env, tmp)));
             v
         }
@@ -249,6 +271,13 @@ fn connect_first(candidates: &[Candidate]) -> io::Result<Box<dyn Stream>> {
     for c in candidates {
         let r = match c {
             Candidate::Fixed(p) => connect_stream_at(p),
+            #[cfg(unix)]
+            Candidate::Root(p) => connect_root(p),
+            #[cfg(not(unix))]
+            Candidate::Root(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "root-owned sockets exist only on Unix",
+            )),
             #[cfg(unix)]
             Candidate::PerUser(p) => connect_own(p, rustix::process::geteuid().as_raw()),
             #[cfg(not(unix))]
@@ -303,6 +332,28 @@ fn connect_own(path: &std::path::Path, me: u32) -> io::Result<Box<dyn Stream>> {
         }
     }
     Ok(Box::new(s))
+}
+
+/// Connect to a [`Candidate::Root`] socket after checking its ownership. A
+/// missing socket falls through to the next candidate and a directory we may
+/// not enter is "not authorized"; a wrong owner stops the search as "not the
+/// service" without anything being sent.
+#[cfg(unix)]
+fn connect_root(path: &std::path::Path) -> io::Result<Box<dyn Stream>> {
+    use std::os::unix::fs::MetadataExt;
+    let sock = std::fs::symlink_metadata(path)?;
+    let dir = path.parent().unwrap_or(std::path::Path::new("/"));
+    let dir_meta = std::fs::symlink_metadata(dir)?;
+    if !dir_meta.is_dir() || !root_owned_ok(sock.uid(), dir_meta.uid(), dir_meta.mode()) {
+        return Err(io::Error::other(format!(
+            "refusing {}: it is not the IpsecClient service (socket uid {}, directory uid {},              mode {:o}); the service may not be running",
+            path.display(),
+            sock.uid(),
+            dir_meta.uid(),
+            dir_meta.mode() & 0o7777
+        )));
+    }
+    Ok(Box::new(std::os::unix::net::UnixStream::connect(path)?))
 }
 
 /// Open a raw stream to the service.
@@ -690,8 +741,8 @@ mod tests {
         assert_eq!(
             mac,
             [
-                Candidate::Fixed(PathBuf::from("/x/test.sock")),
-                Candidate::Fixed(PathBuf::from(MACOS_SYSTEM_SOCKET)),
+                Candidate::Root(PathBuf::from("/x/test.sock")),
+                Candidate::Root(PathBuf::from(MACOS_SYSTEM_SOCKET)),
                 Candidate::PerUser(PathBuf::from("/private/tmp/ipsec-client-bob.sock")),
             ]
         );
@@ -823,6 +874,53 @@ mod tests {
         );
         let win = candidates(Os::Windows, env(&[]), &tmp);
         assert_eq!(win, [Candidate::Fixed(PathBuf::from(PIPE_NAME))]);
+    }
+
+    #[test]
+    fn root_socket_needs_root_owner_and_a_closed_directory() {
+        assert!(root_owned_ok(0, 0, 0o40750));
+        assert!(root_owned_ok(0, 0, 0o40755));
+        assert!(!root_owned_ok(501, 0, 0o40750), "user's socket");
+        assert!(!root_owned_ok(0, 501, 0o40750), "user's directory");
+        assert!(!root_owned_ok(0, 0, 0o41777), "/tmp-like directory");
+        assert!(!root_owned_ok(0, 0, 0o40770), "group-writable directory");
+    }
+
+    /// The impostor case (004 T037): a user's socket in a user's directory is
+    /// refused before anything is written, and not as "unauthorized".
+    #[cfg(unix)]
+    #[test]
+    fn user_owned_root_candidate_is_refused_unsent() {
+        use std::io::Read;
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let dir = scratch_dir("root-cand", 0o700);
+        let sock = dir.join("s.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let r = connect_first(&[
+            Candidate::Root(sock.clone()),
+            Candidate::Root(dir.join("never-tried.sock")),
+        ]);
+        let e = r.err().expect("refused");
+        assert!(e.to_string().contains("not the IpsecClient service"), "{e}");
+        assert!(matches!(connect_error(e), ClientError::Unavailable(_)));
+        // No connection was even attempted.
+        match l.accept() {
+            Ok((mut s, _)) => {
+                let mut b = [0u8; 1];
+                panic!("connected: {:?}", s.read(&mut b));
+            }
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::WouldBlock),
+        }
+        // A missing root socket falls through to the next candidate.
+        let r = connect_first(&[
+            Candidate::Root(dir.join("missing.sock")),
+            Candidate::Root(sock),
+        ]);
+        assert!(r.err().unwrap().to_string().contains("not the IpsecClient"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A fresh directory under the temp dir, with `mode`.
