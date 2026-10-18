@@ -113,13 +113,23 @@ jobs:
         run: |
           cargo build -p ipsec-service --locked
           driver="$(cargo test -p ipsec-service --test linux_e2e --no-run --locked --message-format=json \
-            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep /linux_e2e- | tail -n 1)"
           echo "driver=$driver" >> "$GITHUB_OUTPUT"
       - name: End-to-end against strongSwan
         run: |
+          set -o pipefail
           sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
                DRIVER_BIN="${{ steps.build.outputs.driver }}" \
-               tests/linux-e2e/run.sh
+               tests/linux-e2e/run.sh 2>&1 | tee e2e.log
+      # The key lines as an annotation, which is readable without signing in.
+      - name: Summarize the e2e failure
+        if: failure()
+        run: |
+          sed 's/\x1b\[[0-9;]*m//g' e2e.log \
+            | grep -E 'panicked|connection failed|ERROR|WARN|not supported|failed|NO_PROP|IKE_|EAP|selected|==>' \
+            | grep -v 'opening directory' | tail -n 60 > e2e-summary.txt || true
+          msg="$(sed -e 's/%/%25/g' e2e-summary.txt | sed -e ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::error title=linux-e2e::${msg}"
 
   macos:
     runs-on: macos-15
