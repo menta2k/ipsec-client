@@ -1,263 +1,176 @@
 # IPsec Client
 
-A pure-Rust IKEv2/IPsec remote-access VPN client, built in two parts:
+**A lightweight IKEv2/IPsec remote-access VPN client for Windows, Linux and macOS, written
+entirely in Rust.**
 
-- **`ipsec-service`**: the service that owns the IKE and ESP state, the tunnel adapter, routes
-  and DNS:
-  - on Windows, a Windows service running as LocalSystem, with a Wintun adapter
-  - on Linux, a systemd service running as the unprivileged `ipsec-client` account with only
-    `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`, with a TUN device (in development, feature 002)
-- **`ipsec-gui`**: an unprivileged, cross-platform window with a system tray (Windows,
-  Linux and macOS). It controls the service over a versioned local IPC protocol.
+IPsec Client connects your computer to a corporate IKEv2 gateway, such as a FortiGate or
+strongSwan, with a pre-shared key, or with a pre-shared key plus a username and password
+(EAP-MSCHAPv2). It lives in the system tray or menu bar, sets up routes and DNS for you, and
+puts your network back exactly as it was when you disconnect, even after a crash.
 
-The protocol functionality comes from the `ike-connect` prototype, re-implemented in this
-workspace with no dependency on the prototype crates:
+[![CI](https://github.com/menta2k/ipsec-client/actions/workflows/ci.yml/badge.svg)](https://github.com/menta2k/ipsec-client/actions/workflows/ci.yml)
 
-- **IKEv2 handshake**: IKE_SA_INIT and IKE_AUTH, with PSK or with PSK + EAP-MSCHAPv2.
-- **NAT traversal**: NAT-T to gateway port 4500 from an ephemeral local port.
-- **Mode-config**: the internal address and DNS servers.
-- **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun or a Linux TUN device.
-- **Liveness and teardown**: keepalives, DPD, and an IKE DELETE on disconnect.
+> **Status: pre-release.** The client works end to end and is tested continuously on all
+> three platforms, but it has not had its full real-world validation yet. See
+> [Status](#status).
 
-The work is organised in features:
+## Features
 
-- 001: the Windows client
-- 002: the Linux service and desktop
-- 003: connecting from the Windows sign-in screen (Pre-Login Connect)
-- 004: macOS (planned)
+- **One click from the tray.** Pick a profile from the tray or menu-bar icon and you are
+  connected. The icon shows whether you are connected, connecting, or have a problem, and a
+  notification tells you when that changes.
+- **Works with standard gateways.** IKEv2 with a PSK or PSK + EAP-MSCHAPv2, NAT traversal,
+  the gateway's internal address and DNS servers (mode-config), and ESP with AES-256-GCM or
+  AES-256-CBC/HMAC-SHA-256.
+- **Full tunnel or split tunnel**, decided by what the gateway offers. In full-tunnel mode the
+  route to the gateway itself is protected so the tunnel never swallows its own traffic.
+- **Stays connected.** Keepalives and dead-peer detection notice a lost gateway, and
+  auto-reconnect brings the tunnel back after sleep, a Wi-Fi change or a gateway restart.
+- **Leaves no trace.** Every route and DNS change is journaled before it is made and undone on
+  disconnect, on shutdown, and at the next start after a crash.
+- **Secure by design.** The part that holds keys and changes the network runs as a protected
+  system service; the app you click on runs as you and never sees a key. Saved secrets are
+  encrypted with the operating system's protection, and passwords never appear in logs.
+- **Managed machines.** Profiles can be imported from a file by an administrator
+  (`ipsec-service profile import`), and on macOS the administrator chooses which group may
+  control the VPN.
 
-## Architecture
+## Platforms
 
-```text
- ipsec-gui (user)                         ipsec-service (LocalSystem)
- ┌──────────────────────┐   named pipe    ┌────────────────────────────────────────┐
- │ egui window + tray   │  \\.\pipe\      │ server ── ConnectionManager (vpn-core) │
- │ conn: command conn + │  IpsecClient.v1 │            │ session (IKE)  datapath   │
- │       event conn     │◀───────────────▶│            ▼                (ESP)      │
- └──────────────────────┘  JSON frames,   │  ike (protocol)   Wintun · IP Helper · │
-   links ipc-proto only    DACL: SY,BA,IU │                   DPAPI · journal      │
-                                          └────────────────────────────────────────┘
-```
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Versions | Windows 10 and 11, 64-bit | Ubuntu 22.04+, Debian 12+, Fedora 39+ | macOS 13 Ventura or later, Apple Silicon and Intel |
+| Installer | `.msi` | `.deb`, `.rpm` | `.pkg` (also inside a `.dmg`) |
+| App | system tray | system tray (GNOME needs the AppIndicator extension) | menu bar |
+| Who may connect | any signed-in user | members of the `ipsec-client` group | members of the VPN group (`admin` by default) |
 
-| Crate | Purpose | `unsafe` |
-|-------|---------|----------|
-| `crates/ike` | IKEv2/ESP/EAP codecs, key schedule, DH, SK payload, anti-replay | forbidden |
-| `crates/ipc-proto` | GUI↔service messages, framing, blocking client | forbidden |
-| `crates/vpn-core` | Session driver, data path, state machine, profile store, mocks | forbidden |
-| `crates/ipsec-service` | IPC server and host. Windows: SCM, Wintun, IP Helper, DPAPI, pipe. Linux: systemd, TUN, iproute2/resolvectl, Unix socket. | `src/windows/` and `src/linux/sys.rs` only |
-| `crates/ipsec-gui` | eframe window + tray-icon + notifications | `src/pipe_owner.rs` (Windows) only |
-| `crates/ipsec-plap` | Pre-Login Connect: the sign-in screen provider DLL (logic and bounded IPC done; COM layer pending) | `src/pipe_owner.rs` and the COM layer (not yet written), Windows only |
+## Install
 
-On Linux the service listens on `/run/ipsec-client/ipsec-client.sock`. The socket's permissions
-admit only root and the `ipsec-client` group.
+Download the installer for your system from the
+[Releases](https://github.com/menta2k/ipsec-client/releases) page, and check it against
+`SHA256SUMS` if you like (`sha256sum -c SHA256SUMS`).
 
-## Build & test
+### Windows
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --release
-```
+Run `IpsecClient-<version>-x64.msi`. It installs to `C:\Program Files\IpsecClient`, starts the
+IPsec Client service, adds a Start menu entry, and starts the tray icon at every sign-in.
+Uninstall from **Settings › Apps**. Your profiles are kept for a later reinstall.
 
-The tests include end-to-end runs of the real session and data-path code against an
-in-process mock IKEv2 gateway (`vpn-core/tests/end_to_end.rs`), covering:
-
-- PSK and EAP connects
-- a wrong password, and a gateway AUTH mismatch
-- an INVALID_KE group switch
-- gateway lost, and deleted by the gateway
-- auto-reconnect
-- rollback and crash-journal cleanup
-- log redaction
-
-They also include an IPC integration test against the real binary
-(`ipsec-service/tests/mock_service.rs`).
-
-On Linux, the GUI needs `pkg-config`, `libgtk-3-dev`, `libxdo-dev` and
-`libayatana-appindicator3-dev`.
-
-On a Windows machine you can still lint the Linux code. The GUI is left out because its GTK
-dependencies need Linux:
+### Linux
 
 ```sh
-rustup target add x86_64-unknown-linux-gnu
-cargo clippy --target x86_64-unknown-linux-gnu --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -p ipsec-plap -- -D warnings
+sudo apt install ./ipsec-client_*_amd64.deb      # Ubuntu, Debian
+sudo dnf install ./ipsec-client-*.x86_64.rpm      # Fedora
 ```
 
-CI (`.github/workflows/ci.yml`) runs these jobs:
+The package starts the service and adds you to the `ipsec-client` group. **Log out and back
+in** once so the group membership takes effect, then start **IPsec Client** from your
+applications menu (it also starts at login). Other users need to be added to the group:
+`sudo usermod -aG ipsec-client <user>`. Removing the package keeps your profiles; `apt purge`
+deletes them.
 
-- **Windows and Ubuntu 24.04 gates:** fmt, clippy and tests.
-- **The Linux root-only TUN test.**
-- **An end-to-end test against a real strongSwan gateway** in network namespaces
-  (`sudo tests/linux-e2e/run.sh`).
-- **Installers**, uploaded as build artifacts:
-  - `windows-msi`: the MSI (Wintun 0.14.1 is downloaded and checksum-verified)
-  - `linux-packages`: the `.deb` and `.rpm`
-  - `macos-dmg`: an unsigned `.dmg` with a universal `IPsec Client.app`. Until the macOS
-    service back-end (004) exists, the app only drives `ipsec-service run --mock`.
+### macOS
 
-## Run
+Open `IpsecClient-<version>.pkg` (or the `.dmg`, then the package inside it). It installs
+**IPsec Client** in Applications and a small background service, and starts the service.
+Unsigned pre-release builds have to be opened with right-click › **Open** the first time.
 
-### GUI development on any OS (simulated tunnels)
+The app lives in the menu bar and has no Dock icon. Turn on **Start at login** in its window if
+you want it at every login. If macOS asks you to allow the background item, approve it under
+**System Settings › General › Login Items**.
 
-```sh
-cargo run -p ipsec-service -- run --mock   # terminal 1
-cargo run -p ipsec-gui                     # terminal 2
+## Getting started
+
+1. Open IPsec Client from the tray or menu-bar icon.
+2. On **Profiles**, create a profile with the details from your administrator:
+   - **Gateway**: the VPN server's name or address (port 500 by default)
+   - **Local ID**: the identity the gateway expects from you (a name, an e-mail address or an
+     IP address)
+   - **Authentication**: pre-shared key only, or pre-shared key + username and password
+   - optionally the Diffie-Hellman group, and **Auto-reconnect**
+3. Click **Connect**, from the window or from the tray menu. With a username and password you
+   are asked for the password, and can choose to save it.
+
+The **Status** page shows your VPN address, the DNS servers, the routes, how long you have
+been connected, and the traffic counters. **Log** shows what the service is doing, which helps when a connection
+fails.
+
+## Command line
+
+The `ipsec-service` command manages the service. Most commands need an administrator
+(`sudo` on Linux and macOS, an elevated prompt on Windows).
+
+| Command | What it does |
+|---|---|
+| `ipsec-service start` / `stop` | Start or stop the service (stopping disconnects) |
+| `ipsec-service install` / `uninstall` | Register or remove the service (the installers do this for you) |
+| `ipsec-service uninstall --remove-data` | macOS: also delete profiles, keys and logs |
+| `ipsec-service profile import <file.json>` | Create or update profiles from a file |
+| `ipsec-service access-group [<group>]` | macOS: show or choose the group allowed to control the VPN |
+| `ipsec-service cleanup` | Undo network changes left behind by an unclean exit |
+| `ipsec-service run` | Run the service in the foreground, for troubleshooting (stop the installed one first) |
+
+A profile file looks like this; secrets in it are encrypted as soon as they are imported:
+
+```json
+{ "profiles": [
+  { "name": "Office", "gateway": "vpn.example.com", "local_id": "laptop-42",
+    "auth": "eap", "username": "alice", "psk": "the-shared-key" }
+] }
 ```
 
-On Windows, clients send nothing over `\\.\pipe\IpsecClient.v1` unless SYSTEM or
-Administrators own the pipe. That keeps passwords away from another user's process that
-took the name. A mock service runs as you, so on Windows give it a private pipe name, and set
-the same name in both terminals:
+## Security
 
-```bat
-set IPSEC_CLIENT_PIPE=\\.\pipe\IpsecClient.dev
-```
+- **Privilege separation.** The service (LocalSystem on Windows, a dedicated account with only
+  the network capabilities it needs on Linux, a root daemon on macOS) owns the keys, the tunnel,
+  routes and DNS. The app runs as you and only sends requests.
+- **Only authorized users.** The local control channel is restricted by the operating system:
+  on Linux and macOS only members of the VPN group can open it, and everyone else is told they
+  are not allowed to control the VPN.
+- **Only the real service.** Before sending anything, the app checks that the channel belongs
+  to the system service, so another program cannot impersonate it to collect a password.
+- **Secrets at rest.** Saved pre-shared keys and passwords are encrypted: with DPAPI under the
+  service's own account on Windows, and with a machine key readable only by the service on
+  Linux and macOS. They are never written to logs.
+- **Gateway authentication first.** The gateway has to prove its identity before your password
+  is sent, and it has to prove it again with the result of the password exchange, so a
+  look-alike gateway learns nothing.
+- **Memory-safe code.** The protocol, IPC and engine crates forbid `unsafe`; the few operating
+  system calls that need it are confined to small, reviewed modules.
 
-In mock mode, a password of `fail` simulates an authentication failure, and the gateway
-`unreachable.invalid` simulates a timeout.
+Please report security issues privately to the maintainers rather than in public issues.
 
-### Real tunnels (Windows, elevated)
+## Where things are stored
 
-1. Download `wintun.dll` (amd64) from https://www.wintun.net, and put it next to
-   `ipsec-service.exe`.
-2. Install the service: `ipsec-service install`. It registers with automatic start under
-   LocalSystem and starts.
-3. Run `ipsec-gui` as a normal user. Create a profile and connect from the window or the tray.
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Profiles and keys | `%ProgramData%\IpsecClient` | `/var/lib/ipsec-client` | `/Library/Application Support/IpsecClient` |
+| Logs | `%ProgramData%\IpsecClient\logs` | `/var/lib/ipsec-client/logs` and `journalctl -u ipsec-client` | `/Library/Logs/IpsecClient` and the unified log |
 
-Other commands:
-
-- `ipsec-service run`: the service in a console, which is useful for debugging. Ctrl-C stops
-  it cleanly. It runs as you, not as LocalSystem, so it cannot read secrets the installed
-  service saved: those profiles behave as if no secret were saved. Secrets saved in `run` are
-  machine-scope until the service next starts and re-seals them.
-- `ipsec-service stop`, `uninstall` and `cleanup`.
-
-Data lives in `%ProgramData%\IpsecClient`, which only SYSTEM and Administrators can access:
-
-| Path | Contents |
-|------|----------|
-| `profiles.json` | Profiles, with secrets DPAPI-encrypted under the service account (LocalSystem) key |
-| `netstate.json` | The network-change journal |
-| `logs\` | Daily rotating logs |
-
-The service runs IKE_SA_INIT from UDP source port 500 if it is free. If the Windows IKEEXT
-service holds that port, it falls back to an ephemeral port.
-
-### Windows installer (MSI)
-
-```powershell
-.\installer\build.ps1 -Wintun <path to wintun\bin\amd64\wintun.dll>
-```
-
-The script needs the .NET SDK, and installs WiX 5 as a repo-local dotnet tool on first use. It builds the
-release binaries and writes `target\installer\IpsecClient-<version>-x64.msi`. Without
-`-Wintun`, it looks for `wintun.dll` in `target\release`, then `target\debug`.
-
-The MSI is per-machine. It installs to `C:\Program Files\IpsecClient` and:
-
-- registers and starts the `IpsecClient` service, the same way `ipsec-service install` does
-  (automatic start, LocalSystem, restart 5 s after a failure)
-- adds a Start menu shortcut
-- starts the tray hidden at every logon (`HKLM\...\Run`)
-
-Uninstalling stops the service, which removes the tunnel, and deletes the service. It keeps
-`%ProgramData%\IpsecClient`, so profiles survive a reinstall. Upgrades replace the previous
-version in place once the workspace version in `Cargo.toml` is raised.
-
-If the service was registered earlier with `ipsec-service install`, run
-`ipsec-service uninstall` first. Otherwise the MSI can't create a service with the same name.
-
-### Real tunnels (Linux, in development)
-
-Install the package (see below), or run the service by hand as root:
-
-```sh
-sudo target/release/ipsec-service run       # foreground; Ctrl-C or SIGTERM stops cleanly
-target/release/ipsec-gui                    # as a normal user in the ipsec-client group
-```
-
-With the package, the `ipsec-client.service` systemd unit runs it:
-
-- `sudo ipsec-service install | uninstall | start | stop` wrap `systemctl`.
-- `sudo ipsec-service cleanup` replays the network-change journal.
-
-Users must be in the `ipsec-client` group, then log in again. Others see "not allowed to control
-the VPN".
-
-| Path | Contents |
-|------|----------|
-| `/var/lib/ipsec-client/profiles.json` | Profiles, with secrets encrypted under the machine key |
-| `/var/lib/ipsec-client/secret.key` | The machine key (0600, service account only) |
-| `/var/lib/ipsec-client/netstate.json` | The network-change journal |
-| `/var/lib/ipsec-client/logs/` | Daily rotating logs (also in `journalctl -u ipsec-client`) |
-
-DNS uses systemd-resolved: the VPN servers are set on the tunnel interface with the `~.`
-routing domain. Without resolved, the service backs up and rewrites `/etc/resolv.conf`. This
-needs root, so the packages depend on systemd-resolved.
-
-### Linux packages
-
-```sh
-cargo install cargo-deb cargo-generate-rpm
-packaging/linux/build.sh            # or --deb-only / --rpm-only
-sudo apt install ./target/debian/ipsec-client_*.deb    # Ubuntu 22.04+, Debian 12+
-sudo dnf install ./target/generate-rpm/*.rpm           # Fedora 39+
-```
-
-The `ipsec-client` package installs:
-
-- both programs, the systemd unit, the account (sysusers.d), and a polkit rule for the DNS
-  changes
-- the desktop entry, a tray autostart entry, and the icons
-
-Installing creates the account and group, adds the installing user to the group, and enables
-and starts the service. Removing it stops the service, which tears down any tunnel, and keeps
-`/var/lib/ipsec-client`. A Debian `purge` deletes it. The package maintainer field is a
-placeholder to set before publishing.
-
-### Pre-Login Connect (Windows, in development)
-
-Pre-Login Connect lets users connect the VPN from the Windows sign-in screen, through
-**Network sign-in**. The service side already works:
-
-- administrator-chosen sign-in profiles (`ipsec-service plc enable <name>`)
-- the sign-out policy (`plc policy`)
-- unattended profile import (`profile import`)
-
-The sign-in screen component itself is not built yet. The administrator guide, including the
-recovery procedure, is [docs/pre-login-connect.md](docs/pre-login-connect.md).
+Profiles and keys are readable only by the service (and administrators). Logs never contain
+secrets; they rotate daily and seven days are kept.
 
 ## Status
 
-- **Windows (001):**
-  - The protocol core, IPC, engine and GUI build and pass their tests. The pipe and DPAPI are
-    exercised by tests.
-  - A live tunnel has been run against a FortiGate: it connected and carried traffic in both
-    directions, and the status showed the full-tunnel routes and the VPN DNS servers. The
-    routing table and DNS were not checked independently.
-  - The MSI installer builds and passes validation.
-  - The formal real-tunnel validation checklist is still open.
-- **Linux (002):**
-  - The service code is written and lints cleanly for Linux: TUN, network and DNS
-    configuration, machine-key secrets, systemd, the socket and the packages. The logic is
-    unit-tested on every OS.
-  - **Nothing has run on Linux yet.** The GUI's GTK tray code has never been compiled. CI and
-    the strongSwan end-to-end test will be the first runs, followed by a manual validation on a
-    VM.
-- **Pre-Login Connect (003):**
-  - The service side is done, with tests: sign-in profiles, administrator checks, sign-out
-    policy, the `plc` and `profile import` commands, and the sign-in logic and bounded IPC.
-  - The sign-in screen DLL's COM layer and its installer feature wait on a VM spike (T001).
-- **macOS:** the GUI targets it, but it has never been built there.
+| Platform | State |
+|---|---|
+| **Windows** | Connected to a FortiGate and carried traffic in both directions. The MSI builds and validates. The formal real-tunnel checklist is still open. |
+| **Linux** | Every CI run connects to a real strongSwan gateway (PSK and EAP), checks routes, DNS and traffic through the tunnel, and checks the cleanup. A manual desktop validation is still open. |
+| **macOS** | Every CI run on real Macs (Apple Silicon and Intel) installs, upgrades and removes the package, and tests the tunnel, routes, DNS, crash recovery and access control against a test gateway. Not yet run against a real gateway, and builds are unsigned until a Developer ID is set up. |
+| **Sign-in screen (Windows)** | Connecting before Windows sign-in (Pre-Login Connect) works on the service side; the sign-in screen component is still being built. See [docs/pre-login-connect.md](docs/pre-login-connect.md). |
 
-Not in v1:
+Not supported yet: certificate authentication, IPv6 inside the tunnel, split DNS, IKE over
+TCP, and in-place rekeying (the client reconnects instead).
 
-- certificate authentication
-- in-place rekeying (the client reconnects instead)
-- IPv6 inner traffic
-- IKE over TCP
-- COOKIE retry
-- split DNS
-- a macOS service back-end
+## Building from source
+
+```sh
+cargo build --release
+```
+
+Building, testing, the CI pipeline, making releases and the architecture are described in
+[docs/development.md](docs/development.md).
+
+## License
+
+MIT OR Apache-2.0, at your option.

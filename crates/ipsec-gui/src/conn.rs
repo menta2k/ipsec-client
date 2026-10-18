@@ -193,6 +193,9 @@ mod tests {
                 "{t}"
             );
         }
+        if cfg!(target_os = "macos") {
+            assert!(t.contains("ipsec-service access-group"), "{t}");
+        }
         assert!(
             !t.contains("not running"),
             "must not look like an outage: {t}"

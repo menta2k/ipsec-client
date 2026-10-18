@@ -528,6 +528,58 @@ fn auto_reconnect_after_gateway_delete() {
     h.assert_clean();
 }
 
+/// Sleep/wake or a network change (004 T051, research R14): the gateway goes
+/// quiet past the DPD timeout, the client gives the session up, and
+/// auto-reconnect brings it back once the gateway answers again, with the
+/// gateway host route recomputed for the new network.
+#[test]
+fn auto_reconnect_after_silence_recomputes_the_gateway_route() {
+    let h = harness(
+        ResponderConfig {
+            // Full tunnel, so a gateway host route is needed.
+            remote_ts: (Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 255)),
+            ..Default::default()
+        },
+        |e| {
+            e.auto_reconnect = true;
+            e.password = SecretUpdate::Set(SecretString::new(PASSWORD));
+        },
+    );
+    let host_route = |h: &Harness| {
+        h.net.applied.lock().unwrap().iter().find_map(|c| match c {
+            NetChange::Route {
+                if_id,
+                prefix: 32,
+                next_hop,
+                ..
+            } => Some((*if_id, *next_hop)),
+            _ => None,
+        })
+    };
+    h.connect(None);
+    h.wait_connected();
+    assert_eq!(host_route(&h), Some((99, Ipv4Addr::new(192, 0, 2, 1))));
+
+    // The Mac sleeps; on wake it is on another network.
+    h.resp.set_offline(true);
+    *h.net.gateway_route.lock().unwrap() = Some((7, Ipv4Addr::new(198, 51, 100, 1)));
+    h.wait_state(
+        "reconnect attempt",
+        |s| matches!(s, ConnectionState::Connecting { attempt, .. } if *attempt >= 2),
+    );
+    h.resp.set_offline(false);
+    h.wait_connected();
+    assert!(h.resp.obs().sa_init_count >= 2, "a new IKE SA");
+    assert_eq!(
+        host_route(&h),
+        Some((7, Ipv4Addr::new(198, 51, 100, 1))),
+        "gateway route via the new network"
+    );
+    h.mgr.disconnect().unwrap();
+    h.wait_state("Disconnected", |s| *s == ConnectionState::Disconnected);
+    h.assert_clean();
+}
+
 #[test]
 fn network_failure_rolls_back() {
     let h = harness_with(

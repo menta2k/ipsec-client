@@ -4,14 +4,18 @@
 #              the .deb/.rpm packages.
 #   linux-e2e: the real client against a real strongSwan gateway in network
 #              namespaces (tests/linux-e2e/run.sh).
-#   macos:     the universal app in a .dmg (GUI + service; the macOS service
-#              back-end is feature 004, so the app drives `run --mock` only).
+#   macos-test: the gates on macOS, the root-only utun/route/DNS tests, the
+#              end-to-end and launchd tests against the mock gateway.
+#   macos-intel: the tests on Intel hardware.
+#   macos:     the universal installer (.pkg, and a .dmg holding it), then
+#              install / upgrade / uninstall on the runner.
 # Each packaging job uploads its installer as a build artifact.
 name: CI
 
 on:
   push:
-    branches: [master, main]
+    # Feature branches too (e.g. 004-macos-support), so macOS runs without a PR.
+    branches: [master, main, '[0-9][0-9][0-9]-*']
   pull_request:
   workflow_dispatch:
 
@@ -137,10 +141,88 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build DMG
-        run: sh packaging/macos/build-dmg.sh
+      - name: Build the package and disk image
+        run: sh packaging/macos/build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-dmg
-          path: target/macos/*.dmg
+          name: macos-installer
+          path: |
+            target/macos/*.pkg
+            target/macos/*.dmg
           if-no-files-found: error
+      # Install, upgrade, uninstall (profiles kept), reinstall and
+      # uninstall --remove-data on the runner (004 T045).
+      - name: Package lifecycle
+        run: sh tests/macos-e2e/package.sh
+
+  macos-intel:
+    # 004 T053: the tests on Intel (x86_64) hardware, the other half of the
+    # universal binary. macos-15-intel is the last Intel image GitHub offers.
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Root-only tests (utun, routes, DNS)
+        run: |
+          bin="$(cargo test -p ipsec-service --bin ipsec-service --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          sudo "$bin" --ignored macos_ --test-threads=1
+
+  macos-test:
+    # 004: gates on Apple Silicon, then the root-only utun/route/DNS tests.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Root-only tests (utun, routes, DNS)
+        # Build as the runner user, run the binary as root, so `target/`
+        # never gets root-owned files.
+        run: |
+          bin="$(cargo test -p ipsec-service --bin ipsec-service --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+          sudo "$bin" --ignored macos_ --test-threads=1
+      - name: End-to-end against the mock gateway
+        # 004 T021: the real service, a utun, routes and DNS, against the
+        # vpn-core mock gateway on a lo0 alias (no strongSwan on macOS).
+        run: |
+          set -o pipefail
+          cargo build -p ipsec-service -p vpn-core --example mock_gateway --locked
+          driver="$(cargo test -p ipsec-service --test macos_e2e --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep /macos_e2e- | tail -n 1)"
+          sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
+               GATEWAY_BIN="$PWD/target/debug/examples/mock_gateway" \
+               DRIVER_BIN="$driver" \
+               tests/macos-e2e/run.sh 2>&1 | tee e2e.log
+      - name: The daemon under launchd
+        # 004 T028/T029: crash restart with journal replay, stop, and an
+        # IKE DELETE on a clean shutdown (installs the debug build as the
+        # system daemon; the runner is disposable).
+        run: |
+          set -o pipefail
+          driver="$(cargo test -p ipsec-service --test macos_e2e --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep /macos_e2e- | tail -n 1)"
+          sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
+               GATEWAY_BIN="$PWD/target/debug/examples/mock_gateway" \
+               DRIVER_BIN="$driver" \
+               tests/macos-e2e/daemon.sh 2>&1 | tee -a e2e.log
+      - name: Summarize the e2e failure
+        if: failure()
+        run: |
+          [ -f e2e.log ] || exit 0
+          grep -E 'panicked|connection failed|ERROR|WARN|failed|FAIL|missing|found|timed out|==>|delete=' e2e.log \
+            | tail -n 60 > e2e-summary.txt || true
+          msg="$(sed -e 's/%/%25/g' e2e-summary.txt | sed -e ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::error title=macos-e2e::${msg}"

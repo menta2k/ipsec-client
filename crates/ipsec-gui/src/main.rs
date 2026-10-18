@@ -9,6 +9,8 @@ mod app;
 mod conn;
 mod icon;
 mod icon_export;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod pipe_owner;
 mod tray;
@@ -23,6 +25,14 @@ use eframe::egui;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn should_drop_wayland(display: bool, wayland: bool) -> bool {
     display && wayland
+}
+
+/// Whether to start hidden in the tray. `--tray` asks for it everywhere. On
+/// macOS the login item cannot pass arguments, so the menu bar is the default
+/// there, except on the first launch, which opens the window once (004 T050).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn start_hidden(tray_flag: bool, menu_bar_default: bool, first_launch: bool) -> bool {
+    tray_flag || (menu_bar_default && !first_launch)
 }
 
 fn main() -> eframe::Result {
@@ -57,7 +67,11 @@ fn main() -> eframe::Result {
             }
         }
     }
-    let start_hidden = args.iter().any(|a| a == "--tray");
+    let tray_flag = args.iter().any(|a| a == "--tray");
+    #[cfg(target_os = "macos")]
+    let start_hidden = start_hidden(tray_flag, true, macos::first_launch());
+    #[cfg(not(target_os = "macos"))]
+    let start_hidden = tray_flag;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("IPsec Client")
@@ -68,6 +82,13 @@ fn main() -> eframe::Result {
                 width: 64,
                 height: 64,
             }),
+        // macOS (004 T048): a menu-bar app, with no Dock icon even when run
+        // outside the app bundle.
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     eframe::run_native(
@@ -93,5 +114,16 @@ mod tests {
             "plain X11: nothing to do"
         );
         assert!(!should_drop_wayland(false, false));
+    }
+
+    #[test]
+    fn hidden_start_follows_the_flag_or_the_menu_bar_default() {
+        assert!(start_hidden(true, false, true), "--tray anywhere");
+        assert!(!start_hidden(false, false, false), "window by default");
+        assert!(
+            !start_hidden(false, true, true),
+            "macOS first launch: window"
+        );
+        assert!(start_hidden(false, true, false), "macOS later: menu bar");
     }
 }

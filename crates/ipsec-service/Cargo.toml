@@ -22,8 +22,9 @@ tracing-appender.workspace = true
 ctrlc = { version = "3.4", features = ["termination"] }
 zeroize.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# TUN ioctls, poll and SO_PEERCRED (src/linux/sys.rs only).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Linux: TUN ioctls, poll and SO_PEERCRED (src/linux/sys.rs only).
+# macOS: utun, poll, LOCAL_PEERCRED and syslog (src/macos/sys.rs only).
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

@@ -143,6 +143,69 @@ fn rounded_rect(dx: f32, v: f32, hw: f32, top: f32, bottom: f32, r: f32) -> bool
     true
 }
 
+/// macOS menu-bar glyphs (004 T047). Template images are drawn by the system
+/// from their alpha channel alone, so the states differ by shape, not colour.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    /// Connected: a solid shield with the padlock cut out.
+    Filled,
+    /// Disconnected: the shield's outline.
+    Outline,
+    /// Connecting or disconnecting: the outline holding a padlock.
+    Busy,
+    /// Error: the outline struck through.
+    Struck,
+}
+
+/// Template image sizes: 18 px (1x) and 36 px (2x) for an 18 pt menu bar.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub const TEMPLATE_SIZES: [u32; 2] = [18, 36];
+
+/// `size`x`size` RGBA pixels of a template glyph: black, with coverage in
+/// alpha, fully transparent outside the glyph.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+pub fn render_template(size: u32, glyph: Glyph) -> Vec<u8> {
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    let step = 1.0 / (size * SS) as f32;
+    for y in 0..size {
+        for x in 0..size {
+            let mut hits = 0u32;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let u = ((x * SS + sx) as f32 + 0.5) * step;
+                    let v = ((y * SS + sy) as f32 + 0.5) * step;
+                    hits += u32::from(in_glyph(u, v, glyph));
+                }
+            }
+            let a = (hits as f32 / (SS * SS) as f32 * 255.0).round() as u8;
+            px.extend_from_slice(&[0, 0, 0, a]);
+        }
+    }
+    px
+}
+
+fn in_glyph(u: f32, v: f32, glyph: Glyph) -> bool {
+    let shield = in_shield(u, v);
+    // The outline is the shield minus a smaller copy of itself.
+    let outline = shield && !in_shield(0.5 + (u - 0.5) / 0.74, 0.52 + (v - 0.52) / 0.74);
+    match glyph {
+        Glyph::Filled => shield && !in_padlock(u, v),
+        Glyph::Outline => outline,
+        Glyph::Busy => outline || in_padlock(u, v),
+        Glyph::Struck => outline || on_slash(u, v),
+    }
+}
+
+/// A diagonal bar from the top left to the bottom right.
+fn on_slash(u: f32, v: f32) -> bool {
+    let (ax, ay, bx, by) = (0.14, 0.10, 0.86, 0.90);
+    let (dx, dy) = (bx - ax, by - ay);
+    let t = (((u - ax) * dx + (v - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    let (px, py) = (ax + t * dx - u, ay + t * dy - v);
+    (px * px + py * py).sqrt() <= 0.055
+}
+
 // Used by build.rs and the tests, not by the app itself.
 #[cfg_attr(not(test), allow(dead_code))]
 /// Encodes the icon at `sizes` as a Windows `.ico` with 32-bit BGRA DIB images.
@@ -210,6 +273,38 @@ mod tests {
         // The padlock body is white.
         let i = ((40 * 64 + 22) * 4) as usize;
         assert_eq!(&px[i..i + 3], &[0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn template_glyphs_differ_by_shape_and_are_clear_outside() {
+        let all = [Glyph::Filled, Glyph::Outline, Glyph::Busy, Glyph::Struck];
+        for size in TEMPLATE_SIZES {
+            let imgs: Vec<Vec<u8>> = all.iter().map(|&g| render_template(size, g)).collect();
+            for (img, g) in imgs.iter().zip(all) {
+                assert_eq!(img.len(), (size * size * 4) as usize);
+                // Black only: the system supplies the colour.
+                assert!(img.chunks(4).all(|p| p[..3] == [0, 0, 0]), "{g:?}");
+                for (x, y) in [(0, 0), (size - 1, 0), (0, size - 1), (size - 1, size - 1)] {
+                    assert_eq!(alpha(img, size, x, y), 0, "{g:?} corner at {size}px");
+                }
+                assert!(img.chunks(4).any(|p| p[3] == 255), "{g:?} has a solid part");
+            }
+            for i in 0..imgs.len() {
+                for j in i + 1..imgs.len() {
+                    assert_ne!(imgs[i], imgs[j], "{:?} vs {:?} at {size}px", all[i], all[j]);
+                }
+            }
+        }
+        // At 36 px: the shield's middle is solid when connected, empty when
+        // disconnected; the padlock and the slash fill it for the others.
+        let s = 36;
+        let at = |g, x, y| alpha(&render_template(s, g), s, x, y);
+        assert_eq!(at(Glyph::Filled, 10, 12), 255, "solid shield");
+        assert_eq!(at(Glyph::Outline, 10, 12), 0, "hollow shield");
+        assert_eq!(at(Glyph::Outline, 18, 26), 0);
+        assert_eq!(at(Glyph::Busy, 12, 22), 255, "padlock body");
+        assert_eq!(at(Glyph::Struck, 18, 18), 255, "slash through the centre");
+        assert_eq!(at(Glyph::Outline, 18, 18), 0);
     }
 
     #[test]

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Product archive layout (004 contracts/macos-system-integration.md).
+     build.sh substitutes @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>IPsec Client @VERSION@</title>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true"
+             hostArchitectures="arm64,x86_64"/>
+    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+    <allowed-os-versions>
+        <os-version min="13.0"/>
+    </allowed-os-versions>
+    <choices-outline>
+        <line choice="app"/>
+        <line choice="service"/>
+    </choices-outline>
+    <choice id="app" title="IPsec Client app" visible="false">
+        <pkg-ref id="net.ipsec-client.pkg.app"/>
+    </choice>
+    <choice id="service" title="IPsec Client service" visible="false">
+        <pkg-ref id="net.ipsec-client.pkg.service"/>
+    </choice>
+    <pkg-ref id="net.ipsec-client.pkg.app" version="@VERSION@" onConclusion="none">app.pkg</pkg-ref>
+    <pkg-ref id="net.ipsec-client.pkg.service" version="@VERSION@" onConclusion="none">service.pkg</pkg-ref>
+</installer-gui-script>

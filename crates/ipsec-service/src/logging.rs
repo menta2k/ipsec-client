@@ -49,10 +49,16 @@ pub fn init(log_dir: Option<&Path>, console: bool, ring: &LogBuffer) -> Option<W
             .with_writer(std::io::stderr)
             .with_filter(lvl)
     });
+    // macOS: the real service also reports to the unified log (004 R8).
+    #[cfg(target_os = "macos")]
+    let system_layer = log_dir.map(|_| crate::macos::syslog::SyslogLayer::system());
+    #[cfg(not(target_os = "macos"))]
+    let system_layer: Option<tracing_subscriber::layer::Identity> = None;
     let _ = tracing_subscriber::registry()
         .with(ring.layer().with_filter(lvl))
         .with(file_layer)
         .with(console_layer)
+        .with(system_layer)
         .try_init();
     guard
 }
