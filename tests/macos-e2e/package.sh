@@ -18,9 +18,7 @@ fail() {
     echo "$tail_log" >&2
     # An annotation is readable without signing in to GitHub.
     if [ -n "${GITHUB_ACTIONS:-}" ]; then
-        msg="$(printf '%s
-%s' "$*" "$tail_log" | sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/
-/%0A/g')"
+        msg="$(printf '%s\n%s' "$*" "$tail_log" | sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/\n/%0A/g')"
         echo "::error title=macOS package::$msg"
     fi
     exit 1

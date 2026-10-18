@@ -239,3 +239,36 @@ fn e2e_psk_and_eap_against_the_mock_gateway() {
     }
     assert_eq!(tunnel_interface(), None);
 }
+
+/// For `tests/macos-e2e/daemon.sh`: connect the PSK profile (creating it if
+/// needed) and leave the tunnel up, so the script can crash or stop the
+/// daemon underneath it.
+#[test]
+#[ignore]
+fn daemon_connect_and_stay() {
+    let mut c = command();
+    let existing = match c.request(Request::ListProfiles).expect("list") {
+        Response::Profiles { profiles } => profiles
+            .into_iter()
+            .find(|p| p.name == "daemon-psk")
+            .map(|p| p.id),
+        r => panic!("{r:?}"),
+    };
+    let id = existing.unwrap_or_else(|| create(&mut c, profile("daemon-psk", AuthMode::Psk)));
+    let rx = states();
+    c.request(Request::Connect {
+        id,
+        password: None,
+        save_password: false,
+    })
+    .expect("connect request");
+    wait_for(&rx, "Connected", Duration::from_secs(30), |s| {
+        assert!(
+            !matches!(s, ConnectionState::Error { .. }),
+            "connection failed: {s:?}"
+        );
+        matches!(s, ConnectionState::Connected { .. })
+    });
+    assert!(tunnel_interface().is_some());
+    assert!(system_dns().contains(VPN_DNS));
+}

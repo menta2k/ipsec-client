@@ -187,11 +187,23 @@ jobs:
                GATEWAY_BIN="$PWD/target/debug/examples/mock_gateway" \
                DRIVER_BIN="$driver" \
                tests/macos-e2e/run.sh 2>&1 | tee e2e.log
+      - name: The daemon under launchd
+        # 004 T028/T029: crash restart with journal replay, stop, and an
+        # IKE DELETE on a clean shutdown (installs the debug build as the
+        # system daemon; the runner is disposable).
+        run: |
+          set -o pipefail
+          driver="$(cargo test -p ipsec-service --test macos_e2e --no-run --locked --message-format=json \
+            | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep /macos_e2e- | tail -n 1)"
+          sudo SERVICE_BIN="$PWD/target/debug/ipsec-service" \
+               GATEWAY_BIN="$PWD/target/debug/examples/mock_gateway" \
+               DRIVER_BIN="$driver" \
+               tests/macos-e2e/daemon.sh 2>&1 | tee -a e2e.log
       - name: Summarize the e2e failure
         if: failure()
         run: |
           [ -f e2e.log ] || exit 0
-          grep -E 'panicked|connection failed|ERROR|WARN|failed|missing|==>|delete=' e2e.log \
+          grep -E 'panicked|connection failed|ERROR|WARN|failed|FAIL|missing|found|timed out|==>|delete=' e2e.log \
             | tail -n 60 > e2e-summary.txt || true
           msg="$(sed -e 's/%/%25/g' e2e-summary.txt | sed -e ':a;N;$!ba;s/\n/%0A/g')"
           echo "::error title=macos-e2e::${msg}"

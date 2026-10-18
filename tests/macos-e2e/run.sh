@@ -83,4 +83,20 @@ done
 echo "==> running the e2e driver"
 "$DRIVER_BIN" --ignored --test-threads=1 --nocapture
 grep -q 'delete=true' "$WORK/gateway.log" || { echo "the gateway never saw an IKE DELETE" >&2; exit 1; }
+
+echo "==> no secret in plain text (SC-006)"
+# The state directory (profiles are encrypted), the service's own output at
+# debug level, its log files, and the unified log.
+unified="$(log show --last 15m --style compact --predicate 'process == "ipsec-service"' 2>/dev/null || true)"
+for secret in "gateway-psk" "correct horse" "wrong password"; do
+    if grep -rqF "$secret" "$WORK/state" "$WORK/service.log"; then
+        echo "found '$secret' in plain text:" >&2
+        grep -rlF "$secret" "$WORK/state" "$WORK/service.log" >&2
+        exit 1
+    fi
+    if printf '%s' "$unified" | grep -qF "$secret"; then
+        echo "found '$secret' in the unified log" >&2
+        exit 1
+    fi
+done
 echo "==> e2e passed"

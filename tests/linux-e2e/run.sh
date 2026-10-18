@@ -107,7 +107,7 @@ SWANCTL_CONF=/etc/swanctl/conf.d/ipsec-client-e2e.conf
 install -D -m 600 "$ROOT/tests/linux-e2e/swanctl.conf" "$SWANCTL_CONF"
 ip netns exec vpn-gw swanctl --load-all
 for c in psk eap; do
-    ip netns exec vpn-gw swanctl --list-conns | grep -q "^$c:"         || { echo "strongSwan did not load connection '$c'" >&2; exit 1; }
+    ip netns exec vpn-gw swanctl --list-conns | grep -q "^$c:" || { echo "strongSwan did not load connection '$c'" >&2; exit 1; }
 done
 
 # ---- client ------------------------------------------------------------------
