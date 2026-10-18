@@ -334,10 +334,21 @@ pub struct MockResponder {
 
 impl MockResponder {
     pub fn start(cfg: ResponderConfig) -> MockResponder {
-        let a = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let b = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        a.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
-        b.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        Self::start_on(Ipv4Addr::LOCALHOST, 0, 0, cfg).expect("bind the mock gateway")
+    }
+
+    /// Listen on `addr`, IKE on `ike_port` and NAT-T on `natt_port` (0: any
+    /// free port). The standalone mock gateway uses 500 and 4500.
+    pub fn start_on(
+        addr: Ipv4Addr,
+        ike_port: u16,
+        natt_port: u16,
+        cfg: ResponderConfig,
+    ) -> io::Result<MockResponder> {
+        let a = Arc::new(UdpSocket::bind((addr, ike_port))?);
+        let b = Arc::new(UdpSocket::bind((addr, natt_port))?);
+        a.set_read_timeout(Some(Duration::from_millis(50)))?;
+        b.set_read_timeout(Some(Duration::from_millis(50)))?;
         let obs = Arc::new(Mutex::new(ResponderObs::default()));
         let sa: Arc<Mutex<Option<RespSa>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -390,16 +401,16 @@ impl MockResponder {
                 }
             })
         };
-        MockResponder {
-            ike_port: a.local_addr().unwrap().port(),
-            natt_port: b.local_addr().unwrap().port(),
+        Ok(MockResponder {
+            ike_port: a.local_addr()?.port(),
+            natt_port: b.local_addr()?.port(),
             obs,
             sa,
             natt_sock: b,
             stop,
             offline,
             threads: vec![t1, t2],
-        }
+        })
     }
 
     pub fn obs(&self) -> ResponderObs {
