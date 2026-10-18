@@ -76,6 +76,9 @@ pub struct MockNetConfig {
     /// When set, `prepare` answers a `Dns` change with a `ResolvConf` backup
     /// holding this text (the Linux no-resolved path).
     pub dns_backup: Mutex<Option<String>>,
+    /// What `best_route` answers; `None` gives interface 99 via 192.0.2.1.
+    /// Tests change it to model a network change between connections.
+    pub gateway_route: Mutex<Option<(u64, Ipv4Addr)>>,
     applies: AtomicUsize,
 }
 
@@ -102,7 +105,11 @@ impl NetConfig for MockNetConfig {
         Ok(())
     }
     fn best_route(&self, _dest: Ipv4Addr) -> io::Result<(u64, Ipv4Addr)> {
-        Ok((99, Ipv4Addr::new(192, 0, 2, 1)))
+        Ok(self
+            .gateway_route
+            .lock()
+            .unwrap()
+            .unwrap_or((99, Ipv4Addr::new(192, 0, 2, 1))))
     }
 }
 
@@ -319,6 +326,9 @@ pub struct MockResponder {
     sa: Arc<Mutex<Option<RespSa>>>,
     natt_sock: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
+    /// While set, every datagram is dropped unanswered (sleep, a lost
+    /// network); clearing it brings the gateway back with its state intact.
+    offline: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -331,20 +341,25 @@ impl MockResponder {
         let obs = Arc::new(Mutex::new(ResponderObs::default()));
         let sa: Arc<Mutex<Option<RespSa>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
+        let offline = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(cfg);
 
         let t1 = {
-            let (a, obs, sa, stop, cfg) = (
+            let (a, obs, sa, stop, cfg, offline) = (
                 a.clone(),
                 obs.clone(),
                 sa.clone(),
                 stop.clone(),
                 cfg.clone(),
+                offline.clone(),
             );
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 65535];
                 while !stop.load(Ordering::SeqCst) {
                     if let Ok((n, from)) = a.recv_from(&mut buf) {
+                        if offline.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         if let Some(reply) = handle_sa_init(&buf[..n], &cfg, &obs, &sa) {
                             let _ = a.send_to(&reply, from);
                         }
@@ -353,17 +368,21 @@ impl MockResponder {
             })
         };
         let t2 = {
-            let (b, obs, sa, stop, cfg) = (
+            let (b, obs, sa, stop, cfg, offline) = (
                 b.clone(),
                 obs.clone(),
                 sa.clone(),
                 stop.clone(),
                 cfg.clone(),
+                offline.clone(),
             );
             std::thread::spawn(move || {
                 let mut buf = vec![0u8; 65535];
                 while !stop.load(Ordering::SeqCst) {
                     if let Ok((n, from)) = b.recv_from(&mut buf) {
+                        if offline.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         for out in handle_natt(&buf[..n], from, &cfg, &obs, &sa) {
                             let _ = b.send_to(&out, from);
                         }
@@ -378,12 +397,18 @@ impl MockResponder {
             sa,
             natt_sock: b,
             stop,
+            offline,
             threads: vec![t1, t2],
         }
     }
 
     pub fn obs(&self) -> ResponderObs {
         self.obs.lock().unwrap().clone()
+    }
+
+    /// Drop (`true`) or answer (`false`) everything from now on.
+    pub fn set_offline(&self, offline: bool) {
+        self.offline.store(offline, Ordering::SeqCst);
     }
 
     /// Send a gateway-initiated INFORMATIONAL DELETE of the IKE SA.

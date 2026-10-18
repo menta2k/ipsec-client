@@ -595,3 +595,116 @@ quit
         assert_eq!(parse_ifconfig_inet("utun4: flags=0<> mtu 1400\n"), None);
     }
 }
+
+/// Root-only checks on a real utun (004 T016):
+/// `sudo cargo test -p ipsec-service -- --ignored macos_ --test-threads=1`
+#[cfg(all(test, target_os = "macos"))]
+mod root_tests {
+    use super::*;
+    use crate::macos::{sys, utun::MacTunFactory, SysIfNames};
+    use crate::unix_cmd::SystemRunner;
+    use vpn_core::traits::TunFactory;
+
+    fn sh(argv: &[&str]) -> String {
+        let out = std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .output()
+            .expect("run");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn routes() -> String {
+        sh(&["netstat", "-rn", "-f", "inet"])
+    }
+
+    #[test]
+    #[ignore]
+    fn macos_routes_apply_revert() {
+        let dev = MacTunFactory.create().expect("create utun (root?)");
+        let name = sys::if_name(dev.if_id()).expect("utun name");
+        let net = MacNetConfig::new(SystemRunner, SysIfNames);
+        let addr = NetChange::AdapterAddress {
+            if_id: dev.if_id(),
+            addr: Ipv4Addr::new(10, 251, 0, 1),
+            prefix: 32,
+        };
+        let inner = NetChange::Route {
+            if_id: dev.if_id(),
+            dest: Ipv4Addr::new(10, 251, 1, 0),
+            prefix: 24,
+            next_hop: Ipv4Addr::UNSPECIFIED,
+        };
+        // The gateway host route goes via the current default next hop.
+        let gw = Ipv4Addr::new(192, 0, 2, 77);
+        let (via_if, via_hop) = net.best_route(gw).expect("best route");
+        assert_ne!(via_if, dev.if_id(), "default route is not the utun");
+        let host = NetChange::Route {
+            if_id: via_if,
+            dest: gw,
+            prefix: 32,
+            next_hop: via_hop,
+        };
+        for c in [&addr, &inner, &host] {
+            net.apply(c).unwrap_or_else(|e| panic!("apply {c:?}: {e}"));
+        }
+        let table = routes();
+        assert!(
+            table
+                .lines()
+                .any(|l| l.starts_with("10.251.1") && l.contains(&name)),
+            "inner route on {name}:\n{table}"
+        );
+        assert!(table.contains("192.0.2.77"), "gateway host route:\n{table}");
+
+        for c in [&host, &inner, &addr] {
+            net.revert(c)
+                .unwrap_or_else(|e| panic!("revert {c:?}: {e}"));
+        }
+        let table = routes();
+        assert!(!table.contains("10.251.1"), "inner route left:\n{table}");
+        assert!(!table.contains("192.0.2.77"), "host route left:\n{table}");
+        // Reverting twice is harmless (crash recovery may replay).
+        net.revert(&host).expect("second revert");
+    }
+
+    #[test]
+    #[ignore]
+    fn macos_dns_apply_revert() {
+        let dev = MacTunFactory.create().expect("create utun (root?)");
+        let net = MacNetConfig::new(SystemRunner, SysIfNames);
+        net.apply(&NetChange::AdapterAddress {
+            if_id: dev.if_id(),
+            addr: Ipv4Addr::new(10, 251, 0, 1),
+            prefix: 32,
+        })
+        .expect("address");
+        let dns = NetChange::Dns {
+            if_id: dev.if_id(),
+            servers: vec![Ipv4Addr::new(10, 251, 0, 53)],
+        };
+        net.apply(&dns).expect("apply DNS");
+        let key = format!("show {DNS_SERVICE}/DNS\n");
+        let shown = std::process::Command::new("scutil")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.take().unwrap().write_all(key.as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("scutil");
+        let shown = String::from_utf8_lossy(&shown.stdout).into_owned();
+        assert!(shown.contains("10.251.0.53"), "dynamic store:\n{shown}");
+        let resolvers = sh(&["scutil", "--dns"]);
+        assert!(
+            resolvers.contains("10.251.0.53"),
+            "scutil --dns:\n{resolvers}"
+        );
+
+        net.revert(&dns).expect("revert DNS");
+        let resolvers = sh(&["scutil", "--dns"]);
+        assert!(!resolvers.contains("10.251.0.53"), "DNS left:\n{resolvers}");
+        net.revert(&dns).expect("second revert");
+    }
+}
