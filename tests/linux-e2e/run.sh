@@ -44,6 +44,7 @@ cleanup() {
     [ -n "$CHARON_PID" ] && kill "$CHARON_PID" 2>/dev/null && wait "$CHARON_PID" 2>/dev/null
     ip netns del vpn-cli 2>/dev/null
     ip netns del vpn-gw 2>/dev/null
+    [ -n "${SWANCTL_CONF:-}" ] && rm -f "$SWANCTL_CONF"
     rm -rf "$WORK"
     exit "$status"
 }
@@ -99,7 +100,15 @@ for _ in $(seq 1 50); do
     ip netns exec vpn-gw swanctl --stats >/dev/null 2>&1 && break
     sleep 0.2
 done
-ip netns exec vpn-gw swanctl --load-all --file "$ROOT/tests/linux-e2e/swanctl.conf"
+# AppArmor (Ubuntu 24.04) lets swanctl read only /etc/swanctl, so the config
+# goes into conf.d for the run. swanctl exits 0 even when a file cannot be
+# read, hence the explicit check.
+SWANCTL_CONF=/etc/swanctl/conf.d/ipsec-client-e2e.conf
+install -D -m 600 "$ROOT/tests/linux-e2e/swanctl.conf" "$SWANCTL_CONF"
+ip netns exec vpn-gw swanctl --load-all
+for c in psk eap; do
+    ip netns exec vpn-gw swanctl --list-conns | grep -q "^$c:"         || { echo "strongSwan did not load connection '$c'" >&2; exit 1; }
+done
 
 # ---- client ------------------------------------------------------------------
 echo "==> starting ipsec-service in vpn-cli"
