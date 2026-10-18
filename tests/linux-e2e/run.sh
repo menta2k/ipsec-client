@@ -62,7 +62,7 @@ if [ -z "${SERVICE_BIN:-}" ] || [ -z "${DRIVER_BIN:-}" ]; then
     (cd "$ROOT" && as_user cargo build -p ipsec-service)
     SERVICE_BIN="$ROOT/target/debug/ipsec-service"
     DRIVER_BIN="$(cd "$ROOT" && as_user cargo test -p ipsec-service --test linux_e2e --no-run --message-format=json \
-        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1)"
+        | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | grep /linux_e2e- | tail -n 1)"
 fi
 [ -x "$SERVICE_BIN" ] || { echo "no service binary: $SERVICE_BIN" >&2; exit 1; }
 [ -x "$DRIVER_BIN" ] || { echo "no driver binary: $DRIVER_BIN" >&2; exit 1; }
