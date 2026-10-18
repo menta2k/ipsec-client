@@ -101,8 +101,9 @@ CI (`.github/workflows/ci.yml`) runs these jobs:
 - **Installers**, uploaded as build artifacts:
   - `windows-msi`: the MSI (Wintun 0.14.1 is downloaded and checksum-verified)
   - `linux-packages`: the `.deb` and `.rpm`
-  - `macos-dmg`: an unsigned `.dmg` with a universal `IPsec Client.app`. Until the macOS
-    service back-end (004) exists, the app only drives `ipsec-service run --mock`.
+  - `macos-installer`: an unsigned universal `.pkg` (the app and the root service
+    daemon) and a `.dmg` holding it. CI installs, upgrades and uninstalls it on the
+    runner (`tests/macos-e2e/package.sh`). The macOS port (004) is in progress.
 
 ## Run
 

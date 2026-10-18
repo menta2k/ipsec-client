@@ -10,6 +10,7 @@
 pub mod group;
 pub mod launchd;
 pub mod netconfig;
+pub mod package;
 #[cfg(target_os = "macos")]
 pub mod socket;
 #[cfg(target_os = "macos")]

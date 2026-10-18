@@ -5,8 +5,8 @@
 #   linux-e2e: the real client against a real strongSwan gateway in network
 #              namespaces (tests/linux-e2e/run.sh).
 #   macos-test: the gates on macOS and the root-only utun/route/DNS tests.
-#   macos:     the universal app in a .dmg (GUI + service; the macOS service
-#              back-end is feature 004, so the app drives `run --mock` only).
+#   macos:     the universal installer (.pkg, and a .dmg holding it), then
+#              install / upgrade / uninstall on the runner.
 # Each packaging job uploads its installer as a build artifact.
 name: CI
 
@@ -139,13 +139,19 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Build DMG
-        run: sh packaging/macos/build-dmg.sh
+      - name: Build the package and disk image
+        run: sh packaging/macos/build.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-dmg
-          path: target/macos/*.dmg
+          name: macos-installer
+          path: |
+            target/macos/*.pkg
+            target/macos/*.dmg
           if-no-files-found: error
+      # Install, upgrade, uninstall (profiles kept), reinstall and
+      # uninstall --remove-data on the runner (004 T045).
+      - name: Package lifecycle
+        run: sh tests/macos-e2e/package.sh
 
   macos-test:
     # 004: gates on Apple Silicon, then the root-only utun/route/DNS tests.

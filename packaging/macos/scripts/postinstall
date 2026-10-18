@@ -1,0 +1,32 @@
+#!/bin/sh
+# Service package postinstall (004 T041): directories, the command-line
+# symlink, and the daemon. Profiles, settings and secret.key in the data
+# directory survive upgrades.
+set -e
+label=net.ipsec-client.service
+plist=/Library/LaunchDaemons/$label.plist
+bin=/Library/PrivilegedHelperTools/ipsec-service
+
+/usr/bin/install -d -o root -g wheel -m 0700 "/Library/Application Support/IpsecClient"
+/usr/bin/install -d -o root -g wheel -m 0755 /Library/Logs/IpsecClient
+/usr/sbin/chown root:wheel "$plist" "$bin"
+/bin/chmod 0644 "$plist"
+/bin/chmod 0755 "$bin"
+/bin/mkdir -p /usr/local/bin
+/bin/ln -sf "$bin" /usr/local/bin/ipsec-service
+
+if /bin/launchctl print "system/$label" >/dev/null 2>&1; then
+    /bin/launchctl bootout "system/$label" 2>/dev/null || true
+    # bootout returns before the job is gone; wait up to 10 s.
+    i=0
+    while /bin/launchctl print "system/$label" >/dev/null 2>&1 && [ "$i" -lt 20 ]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+fi
+if ! /bin/launchctl bootstrap system "$plist"; then
+    echo "IPsec Client: the service could not be started. If it is turned off under" >&2
+    echo "System Settings > General > Login Items, turn it on and run" >&2
+    echo "  sudo ipsec-service start" >&2
+fi
+exit 0

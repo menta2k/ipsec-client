@@ -24,6 +24,7 @@ usage: ipsec-service <command>
 commands:
   install        register the IpsecClient service (auto-start, LocalSystem) and start it
   uninstall      stop the service (with network cleanup) and remove it
+                 (macOS: `uninstall --remove-data` also deletes profiles and logs)
   start | stop   control the installed service
   run            run in the foreground (Ctrl-C stops cleanly)
   run --mock     run a simulated engine (no privileges, any OS) for GUI development
@@ -47,6 +48,7 @@ fn main() {
         ["run", "--mock"] => run_console(Mode::Mock),
         ["install"] => manage("install", Manage::Install),
         ["uninstall"] => manage("uninstall", Manage::Uninstall),
+        ["uninstall", "--remove-data"] => uninstall_remove_data(),
         ["start"] => manage("start", Manage::Start),
         ["stop"] => manage("stop", Manage::Stop),
         ["cleanup"] => cleanup(),
@@ -177,7 +179,7 @@ fn manage(what: &str, m: Manage) -> i32 {
     }
     let verb = match m {
         Manage::Install => Verb::Install,
-        Manage::Uninstall => Verb::Uninstall,
+        Manage::Uninstall => return macos_uninstall(false),
         Manage::Start => Verb::Start,
         Manage::Stop => Verb::Stop,
     };
@@ -194,9 +196,6 @@ fn manage(what: &str, m: Manage) -> i32 {
     }
     match run(verb, &unix_cmd::SystemRunner) {
         Ok(()) => {
-            if verb == Verb::Uninstall {
-                let _ = std::fs::remove_file(macos::launchd::PLIST_PATH);
-            }
             println!("{what}: ok");
             0
         }
@@ -205,6 +204,49 @@ fn manage(what: &str, m: Manage) -> i32 {
             e.code
         }
     }
+}
+
+/// macOS `uninstall`: the daemon, its files, the app and the package
+/// receipts; with `remove_data` also profiles, keys, settings and logs.
+#[cfg(target_os = "macos")]
+fn macos_uninstall(remove_data: bool) -> i32 {
+    use macos::package::{execute, uninstall_plan, RealFs};
+    if !macos::sys::is_root() {
+        eprintln!("uninstall: access denied (run with sudo)");
+        return 5;
+    }
+    match execute(
+        &uninstall_plan(remove_data),
+        &unix_cmd::SystemRunner,
+        &RealFs,
+    ) {
+        Ok(()) => {
+            if remove_data {
+                println!("uninstall: ok (profiles and logs deleted)");
+            } else {
+                println!(
+                    "uninstall: ok (profiles kept in {}; `uninstall --remove-data` deletes them)",
+                    paths::MACOS_DATA_DIR
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("uninstall: {}", e.message);
+            e.code
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn uninstall_remove_data() -> i32 {
+    macos_uninstall(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn uninstall_remove_data() -> i32 {
+    eprintln!("uninstall --remove-data: available on macOS only");
+    2
 }
 
 /// `install` on macOS: the binary must already be in place (the package puts

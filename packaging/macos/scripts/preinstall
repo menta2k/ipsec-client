@@ -1,0 +1,15 @@
+#!/bin/sh
+# Service package preinstall (004 T041): stop a running daemon cleanly so an
+# upgrade replaces the binary of a stopped service. Its SIGTERM handler ends
+# the session and reverts the network before it exits.
+label=net.ipsec-client.service
+if /bin/launchctl print "system/$label" >/dev/null 2>&1; then
+    /bin/launchctl bootout "system/$label" 2>/dev/null || true
+    # bootout returns before the job is gone; wait up to 10 s.
+    i=0
+    while /bin/launchctl print "system/$label" >/dev/null 2>&1 && [ "$i" -lt 20 ]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+fi
+exit 0

@@ -19,6 +19,10 @@ pub const LAUNCHD_LABEL: &str = "net.ipsec-client.service";
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const SERVICE_BINARY: &str = "/Library/PrivilegedHelperTools/ipsec-service";
 
+/// macOS: the data and log directories (004 contracts/macos-system-integration.md).
+pub const MACOS_DATA_DIR: &str = "/Library/Application Support/IpsecClient";
+pub const MACOS_LOG_DIR: &str = "/Library/Logs/IpsecClient";
+
 /// State directory of the real service, or a per-user temporary directory
 /// in mock mode:
 /// * Windows: `%ProgramData%\IpsecClient`
@@ -75,16 +79,14 @@ fn state_dir_for(p: Platform, env: impl Fn(&str) -> Option<OsString>) -> PathBuf
             .unwrap_or_else(|| PathBuf::from("/var/lib/ipsec-client")),
         Platform::MacOs => env("IPSEC_CLIENT_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/Library/Application Support/IpsecClient")),
+            .unwrap_or_else(|| PathBuf::from(MACOS_DATA_DIR)),
     }
 }
 
 fn log_dir_for(p: Platform, env: impl Fn(&str) -> Option<OsString>) -> PathBuf {
     match p {
         // A test's private state directory keeps its logs with it.
-        Platform::MacOs if env("IPSEC_CLIENT_STATE_DIR").is_none() => {
-            PathBuf::from("/Library/Logs/IpsecClient")
-        }
+        Platform::MacOs if env("IPSEC_CLIENT_STATE_DIR").is_none() => PathBuf::from(MACOS_LOG_DIR),
         _ => state_dir_for(p, env).join("logs"),
     }
 }

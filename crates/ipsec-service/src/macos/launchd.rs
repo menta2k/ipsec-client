@@ -210,6 +210,13 @@ mod tests {
     }
 
     #[test]
+    fn packaged_plist_matches_the_rendered_one() {
+        // The installer ships this file; `install` writes `render_plist()`.
+        let packaged = include_str!("../../../../packaging/macos/net.ipsec-client.service.plist");
+        assert_eq!(packaged.replace("\r\n", "\n"), render_plist());
+    }
+
+    #[test]
     fn verbs_map_to_launchctl() {
         let line = |v| {
             commands(v)
