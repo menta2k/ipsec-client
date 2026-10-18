@@ -5,12 +5,14 @@
 mod host;
 mod linux;
 mod logging;
+mod macos;
 mod paths;
 mod plc_cli;
 mod server;
 mod simulate;
 #[cfg(unix)]
 mod unix;
+mod unix_cmd;
 #[cfg(windows)]
 mod windows;
 
@@ -68,6 +70,19 @@ fn run_console(mode: Mode) -> i32 {
         eprintln!("error: `run` needs an elevated (Administrator) prompt; use `run --mock` for development");
         return 5;
     }
+    #[cfg(target_os = "macos")]
+    if mode == Mode::Real {
+        if !macos::sys::is_root() {
+            eprintln!("error: `run` needs root (sudo); use `run --mock` for development");
+            return 5;
+        }
+        if macos::launchd::is_loaded(&unix_cmd::SystemRunner) {
+            eprintln!(
+                "error: the service is running under launchd; `sudo ipsec-service stop` first"
+            );
+            return 5;
+        }
+    }
     let host = match host::start(mode, true) {
         Ok(h) => h,
         Err(e) => {
@@ -86,7 +101,10 @@ fn run_console(mode: Mode) -> i32 {
     0
 }
 
-#[cfg_attr(all(unix, not(target_os = "linux")), allow(dead_code))]
+#[cfg_attr(
+    all(unix, not(any(target_os = "linux", target_os = "macos"))),
+    allow(dead_code)
+)]
 enum Manage {
     Install,
     Uninstall,
@@ -145,9 +163,82 @@ fn manage(what: &str, m: Manage) -> i32 {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS: a LaunchDaemon driven with launchctl (004
+/// contracts/service-cli-macos.md).
+#[cfg(target_os = "macos")]
+fn manage(what: &str, m: Manage) -> i32 {
+    use macos::launchd::{run, Verb};
+    if !macos::sys::is_root() {
+        eprintln!("{what}: access denied (run with sudo)");
+        return 5;
+    }
+    let verb = match m {
+        Manage::Install => Verb::Install,
+        Manage::Uninstall => Verb::Uninstall,
+        Manage::Start => Verb::Start,
+        Manage::Stop => Verb::Stop,
+    };
+    let prepared = match verb {
+        Verb::Install => macos_install_files(),
+        Verb::Start if !macos::launchd::is_loaded(&unix_cmd::SystemRunner) => {
+            run(Verb::Install, &unix_cmd::SystemRunner).map_err(|e| e.message)
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = prepared {
+        eprintln!("{what}: {e}");
+        return 1;
+    }
+    match run(verb, &unix_cmd::SystemRunner) {
+        Ok(()) => {
+            if verb == Verb::Uninstall {
+                let _ = std::fs::remove_file(macos::launchd::PLIST_PATH);
+            }
+            println!("{what}: ok");
+            0
+        }
+        Err(e) => {
+            eprintln!("{what}: {}", e.message);
+            e.code
+        }
+    }
+}
+
+/// `install` on macOS: the binary must already be in place (the package puts
+/// it there); write the plist if missing and create the directories.
+#[cfg(target_os = "macos")]
+fn macos_install_files() -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let bin = std::path::Path::new(paths::SERVICE_BINARY);
+    if !bin.exists() {
+        return Err(format!(
+            "{} is missing; install the package, or copy this binary there first",
+            bin.display()
+        ));
+    }
+    let plist = std::path::Path::new(macos::launchd::PLIST_PATH);
+    if !plist.exists() {
+        std::fs::write(plist, macos::launchd::render_plist())
+            .and_then(|()| std::fs::set_permissions(plist, std::fs::Permissions::from_mode(0o644)))
+            .map_err(|e| format!("cannot write {}: {e}", plist.display()))?;
+    }
+    let dir = paths::data_dir(false);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let logs = paths::log_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(&logs)
+        .map_err(|e| format!("cannot create {}: {e}", logs.display()))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn manage(what: &str, _m: Manage) -> i32 {
-    eprintln!("{what}: the service can be installed on Windows and Linux only");
+    eprintln!("{what}: the service can be installed on Windows, Linux and macOS only");
     1
 }
 
@@ -198,9 +289,30 @@ fn cleanup() -> i32 {
     0
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS: replay and clear the change journal (the utun is never left
+/// behind). Refused while the daemon owns the journal.
+#[cfg(target_os = "macos")]
 fn cleanup() -> i32 {
-    eprintln!("cleanup: available on Windows and Linux only");
+    if !macos::sys::is_root() {
+        eprintln!("cleanup: access denied (run with sudo)");
+        return 5;
+    }
+    if macos::launchd::is_loaded(&unix_cmd::SystemRunner) {
+        eprintln!("cleanup: the service is running under launchd; `sudo ipsec-service stop` first");
+        return 5;
+    }
+    let journal = vpn_core::traits::FileJournal {
+        path: paths::data_dir(false).join("netstate.json"),
+    };
+    let net = macos::netconfig::MacNetConfig::new(unix_cmd::SystemRunner, macos::SysIfNames);
+    vpn_core::manager::recover(&macos::utun::MacTunFactory, &net, &journal);
+    println!("cleanup: ok");
+    0
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn cleanup() -> i32 {
+    eprintln!("cleanup: available on Windows, Linux and macOS only");
     1
 }
 
@@ -215,7 +327,33 @@ fn service_entry() -> i32 {
     }
 }
 
-#[cfg(not(windows))]
+/// macOS: the launchd entry point; `run` without console output.
+#[cfg(target_os = "macos")]
+fn service_entry() -> i32 {
+    if !macos::sys::is_root() {
+        eprintln!("service: started by launchd as root; use `run` by hand");
+        return 5;
+    }
+    let host = match host::start(Mode::Real, false) {
+        Ok(h) => h,
+        Err(e) => {
+            // launchd writes stderr to the service.out file.
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Err(e) = ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    }) {
+        eprintln!("warning: could not install the SIGTERM handler: {e}");
+    }
+    let _ = rx.recv();
+    host.stop();
+    0
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn service_entry() -> i32 {
     eprintln!("service: not used on this system; use `run` (the service manager supervises it)");
     2

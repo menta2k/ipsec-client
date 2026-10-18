@@ -89,6 +89,10 @@ fn check_service_pipe_owner(owner: Option<io::Result<String>>) -> io::Result<()>
 /// Socket of the Linux system service (002 contracts/linux-system-integration.md).
 pub const SYSTEM_SOCKET: &str = "/run/ipsec-client/ipsec-client.sock";
 
+/// Socket of the macOS system service (004 contracts/macos-system-integration.md):
+/// in a root-owned directory that only root and the VPN group can enter.
+pub const MACOS_SYSTEM_SOCKET: &str = "/var/run/ipsec-client/ipsec-client.sock";
+
 /// Environment variable that overrides the system socket (tests, developers).
 pub const SOCKET_ENV: &str = "IPSEC_CLIENT_SOCKET";
 
@@ -123,6 +127,7 @@ pub fn endpoints() -> Vec<PathBuf> {
 enum Os {
     Windows,
     Linux,
+    Mac,
     OtherUnix,
 }
 
@@ -132,6 +137,8 @@ impl Os {
             Os::Windows
         } else if cfg!(target_os = "linux") {
             Os::Linux
+        } else if cfg!(target_os = "macos") {
+            Os::Mac
         } else {
             Os::OtherUnix
         }
@@ -176,7 +183,7 @@ impl Candidate {
     }
 }
 
-/// Linux: override, system socket, then the per-user (mock) socket.
+/// Linux and macOS: override, system socket, then the per-user (mock) socket.
 /// Windows keeps its single pipe; other Unixes have no system service.
 fn candidates(
     os: Os,
@@ -185,12 +192,17 @@ fn candidates(
 ) -> Vec<Candidate> {
     match os {
         Os::Windows => vec![Candidate::Fixed(windows_pipe(&env))],
-        Os::Linux => {
+        Os::Linux | Os::Mac => {
+            let system = if os == Os::Linux {
+                SYSTEM_SOCKET
+            } else {
+                MACOS_SYSTEM_SOCKET
+            };
             let mut v: Vec<Candidate> = env(SOCKET_ENV)
                 .map(|p| Candidate::Fixed(PathBuf::from(p)))
                 .into_iter()
                 .collect();
-            v.push(Candidate::Fixed(PathBuf::from(SYSTEM_SOCKET)));
+            v.push(Candidate::Fixed(PathBuf::from(system)));
             v.push(Candidate::PerUser(user_socket(&env, tmp)));
             v
         }
@@ -656,14 +668,44 @@ mod tests {
     #[test]
     fn other_unix_has_no_system_socket_and_windows_only_the_pipe() {
         let tmp = PathBuf::from("/tmp");
-        let mac = endpoint_candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
-        assert_eq!(mac, [PathBuf::from("/r/ipsec-client.sock")]);
+        let bsd = endpoint_candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
+        assert_eq!(bsd, [PathBuf::from("/r/ipsec-client.sock")]);
         let win = endpoint_candidates(
             Os::Windows,
             env(&[("IPSEC_CLIENT_SOCKET", "/ignored")]),
             &tmp,
         );
         assert_eq!(win, [PathBuf::from(PIPE_NAME)]);
+    }
+
+    #[test]
+    fn macos_tries_override_then_system_socket_then_per_user() {
+        // 004 data-model.md: client endpoint candidates.
+        let tmp = PathBuf::from("/private/tmp");
+        let mac = candidates(
+            Os::Mac,
+            env(&[("IPSEC_CLIENT_SOCKET", "/x/test.sock"), ("USER", "bob")]),
+            &tmp,
+        );
+        assert_eq!(
+            mac,
+            [
+                Candidate::Fixed(PathBuf::from("/x/test.sock")),
+                Candidate::Fixed(PathBuf::from(MACOS_SYSTEM_SOCKET)),
+                Candidate::PerUser(PathBuf::from("/private/tmp/ipsec-client-bob.sock")),
+            ]
+        );
+        assert_eq!(
+            endpoint_candidates(Os::Mac, env(&[("USER", "bob")]), &tmp),
+            [
+                PathBuf::from("/var/run/ipsec-client/ipsec-client.sock"),
+                PathBuf::from("/private/tmp/ipsec-client-bob.sock"),
+            ]
+        );
+        // The Linux system socket and the Windows pipe override mean nothing.
+        let mac = endpoint_candidates(Os::Mac, env(&[("IPSEC_CLIENT_PIPE", "/p")]), &tmp);
+        assert!(!mac.contains(&PathBuf::from(SYSTEM_SOCKET)));
+        assert!(!mac.contains(&PathBuf::from("/p")));
     }
 
     #[test]
@@ -774,9 +816,9 @@ mod tests {
                 Candidate::PerUser(PathBuf::from("/tmp/ipsec-client-bob.sock")),
             ]
         );
-        let mac = candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
+        let bsd = candidates(Os::OtherUnix, env(&[("XDG_RUNTIME_DIR", "/r")]), &tmp);
         assert_eq!(
-            mac,
+            bsd,
             [Candidate::PerUser(PathBuf::from("/r/ipsec-client.sock"))]
         );
         let win = candidates(Os::Windows, env(&[]), &tmp);

@@ -17,12 +17,23 @@ eframe = { version = "0.37", default-features = false, features = ["clipboard", 
 tray-icon = "0.26"
 # PNG icons for Linux packages (`--write-icons`, 002 T031).
 png = "0.18"
-# Desktop notifications (FR-038).
-notify-rust = "4"
 
 [build-dependencies]
 # Links the generated icon resource into the Windows executable (build.rs).
 embed-resource = "3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Desktop notifications (FR-038). Not on macOS: its back-end there compiles
+# Objective-C (004 research R9); src/macos.rs uses the system API instead.
+notify-rust = "4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Rust bindings to system frameworks (004 research R9): notifications and the
+# login item. Same objc2 generation as winit and tray-icon.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-user-notifications = "0.3"
+objc2-service-management = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # tray-icon on Linux runs on a GTK main loop (libappindicator).

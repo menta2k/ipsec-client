@@ -306,7 +306,93 @@ fn real_parts(
     Ok((mgr, store, listener, guard))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Whether an existing data directory may be used: a directory owned by root
+/// and closed to group and others (004 contracts/macos-system-integration.md;
+/// lesson from security findings F5/F14).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn data_dir_is_trusted(is_dir: bool, owner_uid: u32, mode: u32) -> bool {
+    is_dir && owner_uid == 0 && mode & 0o077 == 0
+}
+
+/// macOS (004): utun, ifconfig/route/scutil, the machine-key secrets as on
+/// Linux, and the VPN-group socket.
+#[cfg(target_os = "macos")]
+fn real_parts(
+    dir: &std::path::Path,
+    console: bool,
+    bus: &EventBus,
+    ring: &LogBuffer,
+) -> io::Result<Parts> {
+    use crate::macos::{
+        netconfig::MacNetConfig,
+        socket::{MacSocketListener, ADMIN_GID},
+        utun::MacTunFactory,
+        SysIfNames,
+    };
+    use crate::unix_cmd::SystemRunner;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use vpn_core::keyfile::KeyFileProtector;
+    use vpn_core::traits::{FileJournal, StdUdpFactory};
+    use vpn_core::{ConnectionManager, Deps, EngineConfig};
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if !data_dir_is_trusted(m.is_dir(), m.uid(), m.mode()) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be a directory owned by root with no group or other access; fix or remove it",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
+        Err(e) => return Err(e),
+    }
+    let logs = paths::log_dir();
+    std::fs::create_dir_all(&logs)?;
+    let guard = logging::init(Some(&logs), console, ring);
+    info!(target: "host", version = env!("CARGO_PKG_VERSION"), "starting");
+
+    let tun = Arc::new(MacTunFactory);
+    let net = Arc::new(MacNetConfig::new(SystemRunner, SysIfNames));
+    let journal = Arc::new(FileJournal {
+        path: dir.join("netstate.json"),
+    });
+    // FR-004: undo whatever a previous unclean exit left behind (the utun is
+    // already gone; its gateway route and DNS keys may not be).
+    vpn_core::manager::recover(tun.as_ref(), net.as_ref(), journal.as_ref());
+
+    let store = Arc::new(
+        ProfileStore::open(
+            Some(dir.join("profiles.json")),
+            Arc::new(KeyFileProtector::new(dir.join("secret.key"))),
+        )
+        .map_err(store_io)?,
+    );
+    let mgr = ConnectionManager::start(Deps {
+        udp: Arc::new(StdUdpFactory),
+        tun,
+        net,
+        journal,
+        store: store.clone(),
+        bus: bus.clone(),
+        config: EngineConfig::default(),
+    });
+
+    // The configurable VPN group arrives with 004 US3; `admin` until then.
+    let socket = paths::socket_path();
+    let listener = Arc::new(MacSocketListener::bind(socket.clone(), ADMIN_GID)?);
+    info!(target: "host", endpoint = %socket.display(), "listening");
+    Ok((mgr, store, listener, guard))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn real_parts(
     _dir: &std::path::Path,
     _console: bool,
@@ -315,7 +401,7 @@ fn real_parts(
 ) -> io::Result<Parts> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "the real VPN service is available on Windows and Linux; use `run --mock`",
+        "the real VPN service is available on Windows, Linux and macOS; use `run --mock`",
     ))
 }
 
@@ -339,5 +425,19 @@ impl Host {
             let _ = t.join();
         }
         info!(target: "host", "stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_root_owned_private_data_dirs_are_used() {
+        assert!(data_dir_is_trusted(true, 0, 0o700));
+        assert!(!data_dir_is_trusted(false, 0, 0o700));
+        assert!(!data_dir_is_trusted(true, 501, 0o700));
+        assert!(!data_dir_is_trusted(true, 0, 0o750));
+        assert!(!data_dir_is_trusted(true, 0, 0o701));
     }
 }

@@ -332,6 +332,7 @@ fn show_window(ctx: &egui::Context) {
 }
 
 /// Desktop notification, off the UI thread.
+#[cfg(not(target_os = "macos"))]
 fn notify(summary: &str, body: &str) {
     let (s, b) = (summary.to_string(), body.to_string());
     std::thread::spawn(move || {
@@ -342,6 +343,10 @@ fn notify(summary: &str, body: &str) {
             .show();
     });
 }
+
+/// macOS: native notifications arrive with 004 T049.
+#[cfg(target_os = "macos")]
+fn notify(_summary: &str, _body: &str) {}
 
 /// What closing the window does (002 FR-022).
 #[derive(Debug, PartialEq, Eq)]

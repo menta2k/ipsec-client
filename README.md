@@ -85,6 +85,13 @@ rustup target add x86_64-unknown-linux-gnu
 cargo clippy --target x86_64-unknown-linux-gnu --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -p ipsec-plap -- -D warnings
 ```
 
+The macOS code (feature 004, in development) is linted the same way:
+
+```sh
+rustup target add aarch64-apple-darwin
+cargo clippy --target aarch64-apple-darwin --all-targets -p ike -p ipc-proto -p vpn-core -p ipsec-service -p ipsec-gui -- -D warnings
+```
+
 CI (`.github/workflows/ci.yml`) runs these jobs:
 
 - **Windows and Ubuntu 24.04 gates:** fmt, clippy and tests.
