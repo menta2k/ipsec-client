@@ -35,7 +35,10 @@ cleanup() {
         || "$SERVICE_BIN" uninstall --remove-data >/dev/null 2>&1
     [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null && wait "$GW_PID" 2>/dev/null
     ifconfig lo0 -alias 10.99.0.1 2>/dev/null
-    rm -rf "$WORK"
+    pkill -u ipsec-e2e-user nc 2>/dev/null
+    sysadminctl -deleteUser ipsec-e2e-user >/dev/null 2>&1
+    dseditgroup -o delete ipsecvpn >/dev/null 2>&1
+    rm -rf "$WORK" /tmp/ipsec-impostor /tmp/ipsec-e2e-driver
     exit "$status"
 }
 trap cleanup EXIT
@@ -98,5 +101,46 @@ connect
 launchctl bootout "$label" || fail "bootout"
 wait_for 10 "the IKE DELETE" grep -q 'delete=true' "$WORK/gateway.log"
 clean || fail "network not restored by the SIGTERM shutdown"
+
+echo "==> access control (T039)"
+user=ipsec-e2e-user
+group=ipsecvpn
+pass="$(openssl rand -hex 16)"
+sysadminctl -addUser "$user" -password "$pass" >/dev/null 2>&1 || fail "create test user"
+dseditgroup -o create -r "IPsec e2e" "$group" >/dev/null || fail "create group"
+drv=/tmp/ipsec-e2e-driver
+install -m 0755 "$DRIVER_BIN" "$drv"
+as_user() { # <expect> [env...]
+    want="$1"; shift
+    sudo -u "$user" env E2E_EXPECT="$want" "$@" "$drv" --ignored --exact access_check --test-threads=1 >/dev/null 2>&1
+}
+/Library/PrivilegedHelperTools/ipsec-service install || fail "reinstall"
+wait_for 10 "the daemon" running
+wait_for 10 "the socket" test -S "$IPSEC_CLIENT_SOCKET"
+as_user denied || fail "a user outside admin was not refused"
+dseditgroup -o edit -a "$user" -t user "$group" || fail "add the user to the group"
+dscacheutil -flushcache
+/Library/PrivilegedHelperTools/ipsec-service access-group "$group" || fail "access-group $group"
+wait_for 10 "the restarted daemon" test -S "$IPSEC_CLIENT_SOCKET"
+[ "$(stat -f %Sg "$(dirname "$IPSEC_CLIENT_SOCKET")")" = "$group" ] || fail "socket directory group"
+as_user allowed || fail "a member of $group was refused"
+/Library/PrivilegedHelperTools/ipsec-service access-group admin || fail "access-group admin"
+wait_for 10 "the restarted daemon" test -S "$IPSEC_CLIENT_SOCKET"
+as_user denied || fail "access not withdrawn after restoring admin"
+
+echo "==> impostor socket (T039)"
+/Library/PrivilegedHelperTools/ipsec-service stop || fail "stop"
+wait_for 10 "the daemon to stop" stopped
+imp=/tmp/ipsec-impostor
+rm -rf "$imp"; sudo -u "$user" mkdir -m 0700 "$imp"
+sudo -u "$user" sh -c "nc -lU $imp/s.sock > $imp/received 2>/dev/null &"
+wait_for 10 "the impostor socket" test -S "$imp/s.sock"
+as_user impostor IPSEC_CLIENT_SOCKET="$imp/s.sock" || fail "the client used a socket root does not own"
+sleep 1
+[ ! -s "$imp/received" ] || fail "the client sent data to the impostor"
+pkill -u "$user" nc 2>/dev/null || true
+rm -rf "$imp" "$drv"
+sysadminctl -deleteUser "$user" >/dev/null 2>&1 || true
+dseditgroup -o delete "$group" >/dev/null 2>&1 || true
 
 echo "==> daemon lifecycle passed"

@@ -272,3 +272,26 @@ fn daemon_connect_and_stay() {
     assert!(tunnel_interface().is_some());
     assert!(system_dns().contains(VPN_DNS));
 }
+
+/// For `tests/macos-e2e/daemon.sh` (004 T039): connect the way the GUI does
+/// (`CommandClient::connect`, with the client's ownership check) as whoever
+/// runs it, and check the outcome named by `E2E_EXPECT`:
+/// `allowed`, `denied` (not in the VPN group) or `impostor` (a socket that
+/// root does not own; refused before anything is sent).
+#[test]
+#[ignore]
+fn access_check() {
+    let expect = std::env::var("E2E_EXPECT").expect("E2E_EXPECT=allowed|denied|impostor");
+    let r = CommandClient::connect("e2e-access");
+    match (expect.as_str(), r) {
+        ("allowed", Ok(mut c)) => {
+            c.request(Request::ListProfiles).expect("list profiles");
+        }
+        ("denied", Err(ClientError::Unauthorized)) => {}
+        ("impostor", Err(ClientError::Unavailable(e))) => {
+            assert!(e.to_string().contains("not the IpsecClient service"), "{e}");
+        }
+        (want, Ok(_)) => panic!("expected {want}, but connected"),
+        (want, Err(e)) => panic!("expected {want}, got {e:?}"),
+    }
+}
