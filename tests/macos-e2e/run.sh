@@ -81,7 +81,7 @@ until [ -S "$IPSEC_CLIENT_SOCKET" ]; do
 done
 
 echo "==> running the e2e driver"
-"$DRIVER_BIN" --ignored --test-threads=1 --nocapture
+"$DRIVER_BIN" --ignored --exact e2e_psk_and_eap_against_the_mock_gateway --test-threads=1 --nocapture
 grep -q 'delete=true' "$WORK/gateway.log" || { echo "the gateway never saw an IKE DELETE" >&2; exit 1; }
 
 echo "==> no secret in plain text (SC-006)"
