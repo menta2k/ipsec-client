@@ -7,6 +7,8 @@ A pure-Rust IKEv2/IPsec remote-access VPN client, built in two parts:
   - on Windows, a Windows service running as LocalSystem, with a Wintun adapter
   - on Linux, a systemd service running as the unprivileged `ipsec-client` account with only
     `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`, with a TUN device (in development, feature 002)
+  - on macOS, a launchd daemon running as root, with a utun interface (in development,
+    feature 004)
 - **`ipsec-gui`**: an unprivileged, cross-platform window with a system tray (Windows,
   Linux and macOS). It controls the service over a versioned local IPC protocol.
 
@@ -16,7 +18,8 @@ workspace with no dependency on the prototype crates:
 - **IKEv2 handshake**: IKE_SA_INIT and IKE_AUTH, with PSK or with PSK + EAP-MSCHAPv2.
 - **NAT traversal**: NAT-T to gateway port 4500 from an ephemeral local port.
 - **Mode-config**: the internal address and DNS servers.
-- **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun or a Linux TUN device.
+- **ESP**: AES-256-GCM-16 or AES-256-CBC/HMAC-SHA-256-128, over Wintun, a Linux TUN device or a
+  macOS utun.
 - **Liveness and teardown**: keepalives, DPD, and an IKE DELETE on disconnect.
 
 The work is organised in features:
@@ -24,7 +27,7 @@ The work is organised in features:
 - 001: the Windows client
 - 002: the Linux service and desktop
 - 003: connecting from the Windows sign-in screen (Pre-Login Connect)
-- 004: macOS (planned)
+- 004: macOS (in development)
 
 ## Architecture
 
@@ -44,12 +47,14 @@ The work is organised in features:
 | `crates/ike` | IKEv2/ESP/EAP codecs, key schedule, DH, SK payload, anti-replay | forbidden |
 | `crates/ipc-proto` | GUI↔service messages, framing, blocking client | forbidden |
 | `crates/vpn-core` | Session driver, data path, state machine, profile store, mocks | forbidden |
-| `crates/ipsec-service` | IPC server and host. Windows: SCM, Wintun, IP Helper, DPAPI, pipe. Linux: systemd, TUN, iproute2/resolvectl, Unix socket. | `src/windows/` and `src/linux/sys.rs` only |
-| `crates/ipsec-gui` | eframe window + tray-icon + notifications | `src/pipe_owner.rs` (Windows) only |
+| `crates/ipsec-service` | IPC server and host. Windows: SCM, Wintun, IP Helper, DPAPI, pipe. Linux: systemd, TUN, iproute2/resolvectl, Unix socket. macOS: launchd, utun, route/ifconfig/scutil, Unix socket. | `src/windows/`, `src/linux/sys.rs` and `src/macos/sys.rs` only |
+| `crates/ipsec-gui` | eframe window + tray-icon + notifications | `src/pipe_owner.rs` (Windows) and `src/macos.rs` (macOS) only |
 | `crates/ipsec-plap` | Pre-Login Connect: the sign-in screen provider DLL (logic and bounded IPC done; COM layer pending) | `src/pipe_owner.rs` and the COM layer (not yet written), Windows only |
 
 On Linux the service listens on `/run/ipsec-client/ipsec-client.sock`. The socket's permissions
-admit only root and the `ipsec-client` group.
+admit only root and the `ipsec-client` group. On macOS it listens on
+`/var/run/ipsec-client/ipsec-client.sock`, open to root and the VPN group (`admin` unless an
+administrator chose another), and the GUI uses it only if root owns it.
 
 ## Build & test
 
@@ -94,16 +99,21 @@ cargo clippy --target aarch64-apple-darwin --all-targets -p ike -p ipc-proto -p 
 
 CI (`.github/workflows/ci.yml`) runs these jobs:
 
-- **Windows and Ubuntu 24.04 gates:** fmt, clippy and tests.
-- **The Linux root-only TUN test.**
-- **An end-to-end test against a real strongSwan gateway** in network namespaces
-  (`sudo tests/linux-e2e/run.sh`).
+- **Windows, Ubuntu 24.04 and macOS 15 gates:** fmt, clippy and tests.
+- **Root-only tests:** the Linux TUN device; on macOS the utun, routes and DNS.
+- **End-to-end tests of the real service:** on Linux against a strongSwan gateway in network
+  namespaces (`sudo tests/linux-e2e/run.sh`); on macOS against the `vpn-core` mock gateway
+  on a loopback alias (`sudo tests/macos-e2e/run.sh`).
 - **Installers**, uploaded as build artifacts:
   - `windows-msi`: the MSI (Wintun 0.14.1 is downloaded and checksum-verified)
   - `linux-packages`: the `.deb` and `.rpm`
   - `macos-installer`: an unsigned universal `.pkg` (the app and the root service
     daemon) and a `.dmg` holding it. CI installs, upgrades and uninstalls it on the
-    runner (`tests/macos-e2e/package.sh`). The macOS port (004) is in progress.
+    runner (`tests/macos-e2e/package.sh`).
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`: it builds the macOS installer, signs
+and notarizes it when the Apple Developer ID secrets are configured (see
+`packaging/macos/sign-and-notarize.sh`), and attaches it to a draft release.
 
 ## Run
 
@@ -205,6 +215,34 @@ DNS uses systemd-resolved: the VPN servers are set on the tunnel interface with 
 routing domain. Without resolved, the service backs up and rewrites `/etc/resolv.conf`. This
 needs root, so the packages depend on systemd-resolved.
 
+### Real tunnels (macOS, in development)
+
+Install the package (`target/macos/IpsecClient-<version>.pkg` from `packaging/macos/build.sh`,
+or the CI artifact). It installs `IPsec Client.app`, the service daemon
+(`net.ipsec-client.service`) and the `ipsec-service` command, and starts the daemon. The
+package is unsigned until a Developer ID is configured, so open it with right-click › Open.
+
+- `sudo ipsec-service install | start | stop` drive `launchctl`. If an administrator turned
+  the daemon off under System Settings › General › Login Items, `start` says so.
+- `sudo ipsec-service uninstall` removes the daemon, the app and the command, and keeps
+  profiles; `uninstall --remove-data` deletes them too.
+- `ipsec-service access-group` shows the group allowed to control the VPN (`admin` by
+  default); `sudo ipsec-service access-group <group>` changes it.
+- For debugging, `sudo ipsec-service stop`, then `sudo ipsec-service run` in the foreground.
+  `sudo ipsec-service cleanup` replays the network-change journal.
+
+The app lives in the menu bar (no Dock icon), can start at login, and posts notifications.
+
+| Path | Contents |
+|------|----------|
+| `/Library/Application Support/IpsecClient/profiles.json` | Profiles, with secrets encrypted under the machine key |
+| `/Library/Application Support/IpsecClient/secret.key` | The machine key (root only, 0600) |
+| `/Library/Application Support/IpsecClient/netstate.json` | The network-change journal |
+| `/Library/Logs/IpsecClient/` | Daily rotating logs; lifecycle events and errors also go to the unified log |
+
+DNS is set through a service of its own in the dynamic store, so the network settings in
+System Settings are never edited, and a reboot clears it too.
+
 ### Linux packages
 
 ```sh
@@ -248,17 +286,21 @@ recovery procedure, is [docs/pre-login-connect.md](docs/pre-login-connect.md).
   - The MSI installer builds and passes validation.
   - The formal real-tunnel validation checklist is still open.
 - **Linux (002):**
-  - The service code is written and lints cleanly for Linux: TUN, network and DNS
-    configuration, machine-key secrets, systemd, the socket and the packages. The logic is
-    unit-tested on every OS.
-  - **Nothing has run on Linux yet.** The GUI's GTK tray code has never been compiled. CI and
-    the strongSwan end-to-end test will be the first runs, followed by a manual validation on a
-    VM.
+  - The service code is written: TUN, network and DNS configuration, machine-key secrets,
+    systemd, the socket and the packages. The logic is unit-tested on every OS.
+  - CI builds everything on Ubuntu 24.04, including the GTK tray, runs the root-only TUN test,
+    and passes the end-to-end test against strongSwan (PSK and EAP-MSCHAPv2, routes, DNS,
+    traffic through the tunnel, cleanup). A manual validation on a desktop VM is still open.
 - **Pre-Login Connect (003):**
   - The service side is done, with tests: sign-in profiles, administrator checks, sign-out
     policy, the `plc` and `profile import` commands, and the sign-in logic and bounded IPC.
   - The sign-in screen DLL's COM layer and its installer feature wait on a VM spike (T001).
-- **macOS:** the GUI targets it, but it has never been built there.
+- **macOS (004):**
+  - The service (utun, routes, DNS, socket and access group, launchd, logging), the installer
+    and the menu-bar app are written. Their logic is unit-tested on every OS.
+  - CI on macOS 15 runs the gates, the root-only utun/route/DNS tests, an end-to-end test
+    against the mock gateway, and installs, upgrades and removes the package.
+  - Not yet run on a real Mac, and not against a real gateway. Signing waits for a Developer ID.
 
 Not in v1:
 
@@ -268,4 +310,3 @@ Not in v1:
 - IKE over TCP
 - COOKIE retry
 - split DNS
-- a macOS service back-end
