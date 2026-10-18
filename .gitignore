@@ -7,3 +7,9 @@
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local tooling and design docs (not part of the repository)
+/specs/
+/.specify/
+/.config/
+/.claude/
