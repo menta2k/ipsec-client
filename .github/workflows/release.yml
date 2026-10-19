@@ -143,6 +143,10 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
+          # Artifacts keep their folders (debian/, generate-rpm/); flatten.
+          find . -mindepth 2 -type f -exec mv -t . {} +
+          find . -mindepth 1 -type d -empty -delete
+          ls -l
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       - name: Publish the release
